@@ -11,7 +11,7 @@ local Replicated   = game:GetService("ReplicatedStorage")
 
 local lp = nil
 local VERSION = "2.9"
-local BUILD = "2.9+autoexec.4"
+local BUILD = "2.9+autoexec.16"
 local CFG_FILE = "aotr_internal_cfg.json"
 -- aotr_run.lua writes this exact copy; the autoexec loader runs it on relaunch.
 local SOURCE_FILE = "aotr_internal_src.lua"
@@ -276,11 +276,17 @@ local cfg = {
     attackHz       = 20,
     attackDelay    = 0.06,
     attackPath     = "auto",
-    tapSpace       = false,
+    tapSpace       = true,
     cameraLock     = false,
     swingSpeed     = 0,
     zeroVelocity   = false,
-    fallLimit      = 45,
+    fallLimit      = 0,
+    speedCap       = 800,
+    cfgVersion     = 1,
+    swingInterval  = 0.20,
+    holdOnPlayer   = 0.14,
+    freshOverlap   = true,
+    countRegisters = true,
     napeEnabled    = true,
     napeMult       = 6,
     napeRange      = 900,
@@ -315,7 +321,8 @@ local cfg = {
 
 local PERSIST = {
     "priority", "hover", "attackHz", "attackDelay", "attackPath", "tapSpace",
-    "cameraLock", "swingSpeed", "zeroVelocity", "fallLimit",
+    "cameraLock", "swingSpeed", "zeroVelocity", "fallLimit", "speedCap",
+    "cfgVersion", "swingInterval", "holdOnPlayer", "freshOverlap", "countRegisters",
     "napeEnabled", "napeMult", "napeRange", "magnet", "magnetSize", "magnetY",
     "pullDetach", "pullWait", "pullNoCollide", "pinNape", "pinDrift",
     "remoteTemplate", "hitSignal", "watchdogSwings", "multiHit", "multiRadius",
@@ -349,6 +356,13 @@ local function loadCfg()
     if not okDecode or type(saved) ~= "table" then return end
     for _, key in ipairs(PERSIST) do
         if saved[key] ~= nil then cfg[key] = saved[key] end
+    end
+    -- Old saved configs used fallLimit=45, which clamped every descent to
+    -- 45 studs/s. Reset that one legacy value once; leave deliberate new saves.
+    if saved.cfgVersion == nil then
+        if tonumber(saved.fallLimit) == 45 then cfg.fallLimit = 0 end
+        if saved.tapSpace == false then cfg.tapSpace = true end
+        cfg.cfgVersion = 1
     end
     autoFarmSaved = cfg.autoFarm == true
 end
@@ -774,6 +788,7 @@ S = {
     kills = 0,
     swings = 0,
     hits = 0,
+    registers = 0,
     rate = 0,
     target = nil,
     dist = nil,
@@ -807,7 +822,9 @@ S = {
         lastDamage = 0, lastSpeed = 0, lastPull = "off", lastPullRan = false,
         lastSwingBefore = 0, lastSwingAfter = 0, lastSwingAt = 0,
         lastHealth = nil, watchHumanoid = nil, deadCounted = false,
-        recent = {}, current = nil,
+        recent = {}, pending = {}, current = nil,
+        registers = 0, avgSpeed = 0, zeroRegisterRun = 0,
+        armedRegistered = false, lastRegisterAt = nil, armAt = nil,
     },
     autoMsg = nil,
     err = nil,
@@ -924,17 +941,29 @@ local function keyTap(keyCode, hold)
     return true
 end
 
-local function vimClick()
+local function vimClick(target)
     if not caps.vim then return false end
     local camera = currentCamera()
     local viewport = camera and camera.ViewportSize
     local x, y = 320, 320
     if viewport and viewport.X > 0 then x, y = viewport.X / 2, viewport.Y / 2 end
+    local aimedAtNape = false
+    local nape = target and target.nape
+    if camera and nape and nape.Parent then
+        local okPoint, point, onScreen = pcall(function()
+            return camera:WorldToViewportPoint(nape.Position)
+        end)
+        if okPoint and onScreen and point.Z > 0 then
+            x, y = point.X, point.Y
+            aimedAtNape = true
+        end
+    end
     local ok = pcall(function()
         caps.vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
         task.wait(0.03)
         caps.vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
     end)
+    if ok then S.clickPath = aimedAtNape and "vim@nape" or "vim@center" end
     return ok
 end
 
@@ -957,21 +986,13 @@ local function equippedTool()
     return nil
 end
 -- reports success even when the game never swings, so the farm stood still.
-local function click()
-    -- The game reads the swing from the mouse. Tool:Activate() only plays the
-    -- animation and returns success, so trying it first meant the click was
-    -- never sent at all. VirtualInputManager goes first, at the crosshair;
-    -- executor mouse functions are the fallback, Activate is the last resort.
-    if vimClick() then
-        S.clickPath = "vim"
-        return true
-    end
+local function click(target)
+    -- Send the ray through the nape, not the crosshair. The executor function
+    -- is the fallback; Tool:Activate only plays the animation.
+    if vimClick(target) then return true end
     if caps.mouse1click then
         local ok = pcall(caps.mouse1click)
-        if ok then
-            S.clickPath = "mouse1click"
-            return true
-        end
+        if ok then S.clickPath = "mouse1click"; return true end
     end
     if caps.mouse1press then
         local ok = pcall(caps.mouse1press)
@@ -989,37 +1010,6 @@ local function click()
         return true
     end
     return false
-end
-
-local Net = { get = nil, get2 = nil, post = nil }
-
-
-function Net.bind()
-    if Net.get and Net.post then return true end
-    local assets = Replicated:FindFirstChild("Assets")
-    local remotes = assets and assets:FindFirstChild("Remotes")
-    if remotes then
-        local get = remotes:FindFirstChild("GET")
-        if get and get:IsA("RemoteFunction") then Net.get = get end
-        local get2 = remotes:FindFirstChild("GET_2")
-        if get2 and get2:IsA("RemoteFunction") then Net.get2 = get2 end
-        local post = remotes:FindFirstChild("POST")
-        if post and post:IsA("RemoteEvent") then Net.post = post end
-    end
-    if Net.get == nil or Net.post == nil then
-        local ok, all = pcall(function() return Replicated:GetDescendants() end)
-        if ok then
-            for _, instance in ipairs(all) do
-                if instance:IsA("RemoteFunction") then
-                    if instance.Name == "GET" and Net.get == nil then Net.get = instance end
-                    if instance.Name == "GET_2" and Net.get2 == nil then Net.get2 = instance end
-                elseif instance:IsA("RemoteEvent") then
-                    if instance.Name == "POST" and Net.post == nil then Net.post = instance end
-                end
-            end
-        end
-    end
-    return Net.get ~= nil or Net.post ~= nil
 end
 
 local function packArgs(...)
@@ -1709,10 +1699,90 @@ function HitSignal.check(watch)
     watch.done = true
     return true
 end
+-- Honest hit registration: the client still owns the rendered blade, but the
+-- server emits POST:FireServer("Hitboxes", "Register", ...) when the blade
+-- actually overlaps the nape. Count those calls as swing/register telemetry.
+function HitSignal.installRegisterHook()
+    HitSignal.registerAvailable = false
+    HitSignal.registerReason = nil
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
+        HitSignal.registerReason = "hookmetamethod/getnamecallmethod unavailable"
+        return false
+    end
+    local assets = Replicated and Replicated:FindFirstChild("Assets")
+    local remotes = assets and assets:FindFirstChild("Remotes")
+    local postRemote = remotes and remotes:FindFirstChild("POST")
+    if not postRemote or not postRemote:IsA("RemoteEvent") then
+        HitSignal.registerReason = "ReplicatedStorage.Assets.Remotes.POST missing"
+        return false
+    end
+    local oldNamecall = nil
+    pcall(function()
+        local mt = getrawmetatable and getrawmetatable(game)
+        if mt then oldNamecall = rawget(mt, "__namecall") end
+    end)
+    local function hook(self, ...)
+        if HitSignal.hookActive ~= true and type(oldNamecall) == "function" then
+            return oldNamecall(self, ...)
+        end
+        local caller = false
+        if type(checkcaller) == "function" then pcall(function() caller = checkcaller() end) end
+        if caller then
+            if type(oldNamecall) == "function" then return oldNamecall(self, ...) end
+            return
+        end
+        if self == postRemote and cfg.countRegisters ~= false then
+            local method = getnamecallmethod()
+            if method == "FireServer" then
+                local a, b = ...
+                if a == "Hitboxes" and b == "Register" then
+                    local now = clock()
+                    local M = S.meter
+                    HitSignal.lastRegisterAt = now
+                    S.registers = (S.registers or 0) + 1
+                    M.registers = (M.registers or 0) + 1
+                    M.zeroRegisterRun = 0
+                    if M.armAt and now - M.armAt <= 0.4 then
+                        M.armedRegistered = true
+                    end
+                    for index = #M.recent, 1, -1 do
+                        local entry = M.recent[index]
+                        if entry and not entry.registered and now - (entry.at or 0) <= 0.4 then
+                            entry.registered = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        if type(oldNamecall) == "function" then return oldNamecall(self, ...) end
+    end
+    local wrapped = hook
+    if type(newcclosure) == "function" then wrapped = newcclosure(hook) end
+    local ok, old = pcall(hookmetamethod, game, "__namecall", wrapped)
+    if not ok then
+        HitSignal.registerReason = "hookmetamethod failed: " .. tostring(old)
+        return false
+    end
+    if type(old) == "function" then oldNamecall = old end
+    if type(oldNamecall) ~= "function" then
+        HitSignal.registerReason = "original __namecall unavailable"
+        return false
+    end
+    HitSignal.originalNamecall = oldNamecall
+    HitSignal.hookActive = true
+    HitSignal.registerAvailable = true
+    HitSignal.hookRemote = postRemote
+    return true
+end
+
+HitSignal.installRegisterHook()
+
 -- Heartbeat, and the nape is only released on death / switch / pause / stop.
 local Pin = {
     active = false, part = nil, model = nil, joints = {}, size = nil, canCollide = nil,
     offset = nil, at = 0, base = nil, drift = 0, msg = nil, conn = nil,
+    cycle = nil, mode = nil,
 }
 
 local function pinJoints(model, part)
@@ -1732,8 +1802,39 @@ local function pinJoints(model, part)
     return list
 end
 
+function Pin.natural()
+    if not Pin.part then return nil end
+    for _, item in ipairs(Pin.joints) do
+        if item.other and item.other.Parent and item.offset then
+            local ok, cf = pcall(function() return item.other.CFrame * item.offset end)
+            if ok and cf then return cf end
+        end
+    end
+    return nil
+end
+
+function Pin.writePark()
+    local natural = Pin.natural()
+    if natural and Pin.part and Pin.part.Parent then
+        pcall(function() Pin.part.CFrame = natural end)
+    end
+    Pin.mode = "park"
+end
+
+function Pin.writeHit()
+    local _, root = myChar()
+    if root and Pin.part and Pin.part.Parent then
+        pcall(function() Pin.part.CFrame = root.CFrame * Pin.offset end)
+    end
+    Pin.mode = "hit"
+end
+
 function Pin.stop(reason)
     if not Pin.active then return false end
+    local natural = Pin.natural()
+    if natural and Pin.part and Pin.part.Parent then
+        pcall(function() Pin.part.CFrame = natural end)
+    end
     for _, item in ipairs(Pin.joints) do
         if item.parent and item.joint.Parent == nil then
             pcall(function() item.joint.Parent = item.parent end)
@@ -1748,9 +1849,34 @@ function Pin.stop(reason)
     S.jointsOff = math.max(0, (S.jointsOff or 0) - #Pin.joints)
     Pin.active, Pin.part, Pin.model, Pin.joints = false, nil, nil, {}
     Pin.size, Pin.canCollide, Pin.offset, Pin.base, Pin.drift = nil, nil, nil, nil, 0
+    Pin.cycle, Pin.mode = nil, nil
     S.pinActive, S.pullRan, S.pullMethod = false, false, "off"
     if reason then S.pinMsg = reason end
     return true
+end
+
+function Pin.park(reason)
+    if not Pin.active then return false end
+    Pin.writePark()
+    Pin.cycle = { stage = "park", beats = 0 }
+    if reason then S.pinMsg = reason end
+    return true
+end
+
+function Pin.startCycle()
+    if not Pin.active then return false end
+    if cfg.freshOverlap ~= true then Pin.writeHit(); return true end
+    if not Pin.cycle then
+        Pin.cycle = { stage = "park", beats = 0 }
+        Pin.writePark()
+    end
+    return true
+end
+
+function Pin.afterClick()
+    if cfg.freshOverlap ~= true or not Pin.active or not Pin.cycle then return end
+    Pin.cycle.stage = "hold"
+    Pin.cycle.holdUntil = clock() + (tonumber(cfg.holdOnPlayer) or 0.14)
 end
 
 function Pin.ensure(target)
@@ -1781,13 +1907,17 @@ function Pin.ensure(target)
             local enabled = true
             pcall(function() enabled = joint.Enabled end)
             local parent = joint.Parent
+            local okOffset, offset = pcall(function() return other.CFrame:ToObjectSpace(nape.CFrame) end)
             local detached = pcall(function() joint.Enabled = false end)
             if cfg.pullDetach == "unparent" and (joint:IsA("Weld") or joint:IsA("WeldConstraint")) then
                 local okParent = pcall(function() joint.Parent = nil end)
                 if okParent then detached = true end
             end
             if detached then disabled = disabled + 1 end
-            Pin.joints[#Pin.joints + 1] = { joint = joint, enabled = enabled, parent = parent }
+            Pin.joints[#Pin.joints + 1] = {
+                joint = joint, enabled = enabled, parent = parent,
+                other = other, offset = okOffset and offset or nil,
+            }
         end
     end
     if disabled == 0 then
@@ -1804,6 +1934,8 @@ function Pin.ensure(target)
     local hrp = target.model:FindFirstChild("HumanoidRootPart")
     Pin.base = hrp and hrp.Position or nil
     Pin.active, Pin.at, Pin.drift = true, clock(), 0
+    Pin.cycle, Pin.mode = nil, "park"
+    Pin.writePark()
     Pin.msg = string.format("pinned (%d joints off)", disabled)
     S.pinActive, S.pullRan, S.pullMethod, S.pullMsg = true, true, "pin", Pin.msg
     S.jointsOff = (S.jointsOff or 0) + disabled
@@ -1826,10 +1958,35 @@ function Pin.step()
         return
     end
     local _, root = myChar()
-    if not root then return end
+    if not root then Pin.park("pin: no character") return end
     local hrp = Pin.model:FindFirstChild("HumanoidRootPart")
     local before = hrp and hrp.Position
-    pcall(function() Pin.part.CFrame = root.CFrame * Pin.offset end)
+    if cfg.freshOverlap == true then
+        local cycle = Pin.cycle
+        if not cycle then
+            Pin.park(nil)
+            cycle = Pin.cycle
+        end
+        if cycle.stage == "hold" and clock() < (cycle.holdUntil or 0) then
+            Pin.writeHit()
+        else
+            if cycle.stage == "hold" then
+                cycle.stage, cycle.beats = "park", 0
+            end
+            if cycle.stage == "hit" then
+                Pin.writeHit()
+            else
+                Pin.writePark()
+                cycle.beats = (cycle.beats or 0) + 1
+                if cycle.beats >= 2 then
+                    cycle.stage, cycle.beats = "hit", 0
+                    Pin.writeHit()
+                end
+            end
+        end
+    else
+        Pin.writeHit()
+    end
     local after = hrp and hrp.Position
     if before and after then
         Pin.drift = (after - before).Magnitude
@@ -1839,8 +1996,8 @@ function Pin.step()
             local moved = Pin.drift
             cfg.pullDetach = "unparent"
             saveCfg()
-            Pin.stop(string.format("drift %.1f studs - pullDetach=unparent", moved))
-            S.autoMsg = string.format("pin drift %.1f studs: unparent fallback", moved)
+            Pin.park(string.format("drift %.1f studs - re-parked", moved))
+            S.autoMsg = string.format("pin drift %.1f studs: re-parked", moved)
         end
     end
     if Pin.active then S.pullRan, S.pullMethod = true, "pin" end
@@ -2304,7 +2461,7 @@ local function pruneNapes()
     end
 end
 --============================================================================
-local Hover = { base = nil, goal = nil, face = nil, conn = nil, phase = 0 }
+local Hover = { base = nil, goal = nil, face = nil, conn = nil, phase = 0, wasOwner = false }
 
 local function setOwner(name)
     S.owner = name
@@ -2314,21 +2471,28 @@ local function setOwner(name)
 end
 
 local function hoverStep(dt)
+    local _, root, humanoid = myChar()
     if not S.running or S.owner ~= "farm" or not Hover.base then
         Hover.goal = nil
+        if Hover.wasOwner then
+            if root then pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end) end
+            Hover.wasOwner = false
+        end
         return
     end
-    local _, root = myChar()
-    if not root then return end
+    if not root then Hover.wasOwner = false return end
+    if S.results or S.refilling or S.reloading or (humanoid and humanoid.Health <= 0) then
+        pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+        Hover.wasOwner, Hover.goal = false, nil
+        return
+    end
+    Hover.wasOwner = true
     local step = math.clamp(dt or 0, 0, 0.1)
     Hover.phase = (Hover.phase or 0) + step * (cfg.bobHz or 1.5) * 6.28318
     local bob = math.sin(Hover.phase) * (cfg.bobAmp or 2)
     local goal = Hover.base + Vector3.new(0, bob, 0)
     Hover.goal = goal
 
-    -- CFrame.new(goal) alone resets rotation to identity every frame. Keep the
-    -- current upright rotation, and face the titan horizontally when there is
-    -- an offset to face.
     local rotation = root.CFrame.Rotation
     local look = rotation.LookVector
     local flatLook = Vector3.new(look.X, 0, look.Z)
@@ -2345,8 +2509,6 @@ local function hoverStep(dt)
 
     pcall(function()
         root.CFrame = CFrame.new(goal) * rotation
-        -- Velocity feeds the game's damage formula. Do not touch it by
-        -- default; zeroVelocity and fallLimit are explicit A/B switches.
         local velocity = root.AssemblyLinearVelocity
         if cfg.zeroVelocity then
             if S.swingBoostUntil and clock() < S.swingBoostUntil then
@@ -2358,6 +2520,11 @@ local function hoverStep(dt)
             local limit = tonumber(cfg.fallLimit) or 0
             if limit > 0 and velocity.Y < -limit then
                 root.AssemblyLinearVelocity = Vector3.new(velocity.X, -limit, velocity.Z)
+            end
+            local cap = tonumber(cfg.speedCap) or 800
+            local current = root.AssemblyLinearVelocity
+            if cap > 0 and current.Magnitude > cap then
+                root.AssemblyLinearVelocity = current.Unit * cap
             end
         end
     end)
@@ -2372,8 +2539,11 @@ end
 
 local function hoverStop()
     if Hover.conn then pcall(function() Hover.conn:Disconnect() end) end
+    local _, root = myChar()
+    if root then pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end) end
     Hover.conn = nil
     Hover.goal, Hover.base, Hover.face = nil, nil, nil
+    Hover.wasOwner = false
     S.owner = nil
     S.swingBoostUntil = nil
 end
@@ -3509,37 +3679,82 @@ local function meterReset()
     M.lastDamage, M.lastSpeed, M.lastPull, M.lastPullRan = 0, 0, "off", false
     M.lastSwingBefore, M.lastSwingAfter, M.lastSwingAt = 0, 0, 0
     M.lastHealth, M.watchHumanoid, M.deadCounted = nil, nil, false
-    M.recent, M.current, M.watch = {}, nil, nil
+    M.recent, M.pending, M.current, M.watch = {}, {}, nil, nil
+    M.registers, M.avgSpeed, M.zeroRegisterRun = 0, 0, 0
+    M.armedRegistered, M.lastRegisterAt, M.armAt = false, nil, nil
 end
 
--- The confirmed hit signal is the only proof of damage; posted calls are not.
 local function meterTick()
     local M = S.meter
-    if M.watch then HitSignal.check(M.watch) end
+    if not M then return end
     local humanoid = M.watchHumanoid
-    if not humanoid or not humanoid.Parent then return end
-    local health = tonumber(humanoid.Health)
-    if health == nil then return end
-    if M.lastHealth == nil then
-        M.lastHealth = health
-        return
+    if humanoid and humanoid.Parent then
+        local health = tonumber(humanoid.Health)
+        if health ~= nil then
+            if M.lastHealth == nil then
+                M.lastHealth = health
+            else
+                if health <= 0 and (M.lastHealth or 0) > 0 and not M.deadCounted then
+                    M.kills = (M.kills or 0) + 1
+                    M.swingsSinceKill = 0
+                    M.deadCounted = true
+                end
+                M.lastHealth = health
+            end
+        end
     end
-    if health <= 0 and (M.lastHealth or 0) > 0 and not M.deadCounted then
-        M.kills = M.kills + 1
-        M.swingsSinceKill = 0
-        M.deadCounted = true
+    if M.watch then HitSignal.check(M.watch) end
+    if not M.pending or #M.pending == 0 then return end
+    local now = clock()
+    local keep = {}
+    for _, pending in ipairs(M.pending) do
+        if pending.watch then HitSignal.check(pending.watch) end
+        local entry = pending.entry
+        if pending.watch and pending.watch.hit and not pending.applied then
+            pending.applied = true
+            local damage = tonumber(pending.watch.damage) or 0
+            M.damage = (M.damage or 0) + damage
+            M.hits = (M.hits or 0) + 1
+            S.hits = (S.hits or 0) + 1
+            M.lastDamage = damage
+            local hp = pending.humanoid and pending.humanoid.Parent
+                and tonumber(pending.humanoid.Health) or nil
+            if hp then M.lastSwingAfter = hp end
+            if entry then
+                entry.after = hp or entry.after
+                entry.damage = damage
+                entry.confirmed = true
+            end
+            if M.current == entry then M.current.confirmed = true end
+            if pending.path then Path.note(pending.path, true) end
+            S.swingsNoHit, S.watchdogStage, S.watchdogMsg = 0, 0, nil
+        end
+        local done = pending.watch and (pending.watch.hit or pending.watch.done)
+        local timedOut = now - (pending.at or now) > 0.45
+        if done or timedOut then
+            if not (pending.watch and pending.watch.hit) then
+                if entry and pending.humanoid and pending.humanoid.Parent then
+                    entry.after = tonumber(pending.humanoid.Health) or entry.after
+                end
+                if pending.path then Path.note(pending.path, false) end
+                if Path.nohitEligible() then S.swingsNoHit = (S.swingsNoHit or 0) + 1 end
+            end
+        else
+            keep[#keep + 1] = pending
+        end
     end
-    M.lastHealth = health
+    M.pending = keep
 end
 
-local function noteSwing(pullRan, healthBefore, path)
+local function noteSwing(pullRan, healthBefore, path, watchBefore)
     local M = S.meter
     local target = S.target
     local humanoid = target and target.model and target.model:FindFirstChildOfClass("Humanoid")
-    local before = HitSignal.fast(target and target.model)
+    local before = watchBefore or HitSignal.fast(target and target.model)
     if healthBefore ~= nil then before.health = healthBefore end
-    M.swings = M.swings + 1
-    M.swingsSinceKill = M.swingsSinceKill + 1
+    M.swings = (M.swings or 0) + 1
+    M.swingsSinceKill = (M.swingsSinceKill or 0) + 1
+    S.swings = (S.swings or 0) + 1
     M.lastSpeed = S.swingVel and S.swingVel.Magnitude or 0
     M.lastPull = S.pullMethod or "off"
     M.lastPullRan = pullRan == true
@@ -3550,163 +3765,172 @@ local function noteSwing(pullRan, healthBefore, path)
     M.watchHumanoid = humanoid
     M.lastHealth = M.lastSwingBefore
     M.deadCounted = M.lastSwingBefore <= 0
-    M.watch = {
+    local watch = {
         model = target and target.model, before = before, at = clock(),
         damage = 0, hit = false, done = false, path = path,
     }
+    M.watch = watch
     local entry = {
-        at = clock(), before = M.lastSwingBefore, after = M.lastSwingBefore, damage = 0,
-        speed = M.lastSpeed, pull = M.lastPull, ran = M.lastPullRan, humanoid = humanoid,
-        path = path, confirmed = false,
+        at = clock(), before = M.lastSwingBefore, after = M.lastSwingBefore,
+        damage = 0, speed = M.lastSpeed, pull = M.lastPull, ran = M.lastPullRan,
+        humanoid = humanoid, path = path, confirmed = false,
+        registered = M.armedRegistered == true,
     }
     M.recent[#M.recent + 1] = entry
-    while #M.recent > 20 do table.remove(M.recent, 1) end
+    while #M.recent > 30 do table.remove(M.recent, 1) end
+    local sum, count = 0, 0
+    for index = math.max(1, #M.recent - 9), #M.recent do
+        sum = sum + (M.recent[index].speed or 0)
+        count = count + 1
+    end
+    M.avgSpeed = count > 0 and sum / count or 0
+    M.zeroRegisterRun = (M.zeroRegisterRun or 0) + 1
+    if entry.registered then M.zeroRegisterRun = 0 end
     M.current = entry
+    M.pending[#M.pending + 1] = {
+        model = target and target.model, humanoid = humanoid, watch = watch,
+        entry = entry, path = path, at = clock(),
+    }
+    return entry
 end
 
--- A swing succeeds only when HitSignal confirms a change inside 0.4 s. In auto
--- mode the ladder tries gui -> remote -> mouse until one path confirms.
 local function executeSwing(countStats, pullRan)
     local now = clock()
     if S.slashReleaseAt and now < S.slashReleaseAt then return nil end
     if S.nextSlashAt and now < S.nextSlashAt then return nil end
     local target = S.target
     if not target or not target.model then return nil end
+    if cfg.freshOverlap == true and Pin.active then
+        if not Pin.cycle then
+            Pin.startCycle()
+            return nil
+        end
+        if Pin.cycle.stage ~= "hit" then return nil end
+    end
     local humanoid = target.model:FindFirstChildOfClass("Humanoid")
     local healthBefore = humanoid and humanoid.Health or nil
 
-    -- Deliberate velocity for the hit that is about to be sent. The hover loop
-    -- only touches velocity when zeroVelocity or fallLimit is enabled.
-    if (cfg.swingSpeed or 0) > 0 then
-        local _, swingRoot = myChar()
-        if swingRoot then
+    local autoDown = false
+    if (tonumber(cfg.swingSpeed) or 0) <= 0
+        and clock() - (S.startedAt or clock()) >= 3 then
+        local average = tonumber(S.meter.avgSpeed) or 0
+        if average < 300 then autoDown = true end
+    end
+    local _, swingRoot = myChar()
+    if swingRoot then
+        if (tonumber(cfg.swingSpeed) or 0) > 0 then
             local look = swingRoot.CFrame.LookVector
             local flat = Vector3.new(look.X, 0, look.Z)
             if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
             swingRoot.AssemblyLinearVelocity = flat.Unit * cfg.swingSpeed
             S.swingBoostUntil = clock() + 0.15
+        elseif autoDown then
+            local down = math.min(tonumber(cfg.speedCap) or 800, 700)
+            swingRoot.AssemblyLinearVelocity = Vector3.new(0, -down, 0)
+            S.swingBoostUntil = clock() + 0.15
         end
     end
     local _, velocityRoot = myChar()
     S.swingVel = velocityRoot and velocityRoot.AssemblyLinearVelocity or nil
-    S.slashReleaseAt = clock() + 0.03
-    task.delay(0.03, function()
-        S.slashReleaseAt = nil
-        S.nextSlashAt = clock() + (cfg.attackDelay or 0.06)
-    end)
 
-    local explicit = (cfg.attackPath or "auto") ~= "auto"
-    local tries = explicit and 1 or #Path.order
-    local did, confirmed, totalDamage = nil, false, 0
-    for attempt = 1, tries do
-        local path = Path.current()
-        local fired = false
-        if path == "gui" then
-            fired = guiSwing()
-            S.clickPath = fired and "gui" or "gui (no Slash button)"
-        elseif path == "remote" then
-            local sent = remoteSwing(target)
-                    fired = sent > 0
-            S.clickPath = fired and "remote" or "remote (refused)"
-        elseif path == "mouse" then
-            fired = click()
-            S.clickPath = fired and (S.clickPath or "mouse") or "mouse (no input)"
-        end
-        if fired then
-            noteSwing(pullRan, healthBefore, path)
-            if cfg.tapSpace then keyTap(Enum.KeyCode.Space, 0.02) end
-            local watch = S.meter.watch
-            local deadline = clock() + 0.4
-            while clock() < deadline do
-                if HitSignal.check(watch) then break end
-                task.wait(0.03)
-            end
-            HitSignal.check(watch)
-            if watch and watch.hit then
-                confirmed, did = true, path
-                totalDamage = watch.damage or 0
-                if countStats then S.hits = (S.hits or 0) + 1 end
-                S.meter.damage = (S.meter.damage or 0) + totalDamage
-                S.meter.hits = (S.meter.hits or 0) + 1
-                S.swingsNoHit, S.watchdogStage, S.watchdogMsg = 0, 0, nil
-                S.meter.lastDamage = totalDamage
-                S.meter.lastSwingAfter = humanoid and humanoid.Health or S.meter.lastSwingAfter
-                if S.meter.current then
-                    S.meter.current.after = S.meter.lastSwingAfter
-                    S.meter.current.damage = totalDamage
-                    S.meter.current.signal = watch.signal
-                    S.meter.current.confirmed = true
-                end
-                if countStats then
-                    S.swings = (S.swings or 0) + 1
-                    Path.note(path, true)
-                end
-                break
-            end
-            if countStats then
-                S.swings = (S.swings or 0) + 1
-                Path.note(path, false)
-            end
-            did = did or path
-            if explicit then
-                S.clickPath = path .. " (no confirmed hit)"
-                break
-            end
-            if Path.locked then
-                -- A locked path gets one attempt per swing; retest at 50.
-                break
-            end
-            Path.advance()
-            if attempt < tries then task.wait(0.02) end
-        else
-            if Path.locked == path then Path.locked = nil end
-            if not explicit then Path.advance() end
-        end
+    local interval = math.clamp(tonumber(cfg.swingInterval) or 0.20, 0.12, 0.40)
+    S.slashReleaseAt = clock() + 0.03
+    S.nextSlashAt = clock() + interval
+    task.delay(0.03, function() S.slashReleaseAt = nil end)
+
+    local swingPath = cfg.attackPath
+    if swingPath ~= "gui" and swingPath ~= "remote" then swingPath = "mouse" end
+    S.meter.armAt = clock()
+    S.meter.armedRegistered = false
+    -- The watch baseline must be taken before the click: a server can apply
+    -- damage synchronously while the click is being sent.
+    local preWatch = HitSignal.fast(target.model)
+    local fired = false
+    if swingPath == "gui" then
+        fired = guiSwing()
+        if fired then S.clickPath = "gui" end
+    elseif swingPath == "remote" then
+        fired = remoteSwing(target) > 0
+        if fired then S.clickPath = "remote" end
+    else
+        fired = click(target)
     end
-    -- One count per swing, not one per path attempt. Only a swing that actually
-    -- fired and could have hit counts, and the liveness checks are re-read now
-    -- because the ladder may have taken several attempts.
-    if countStats and did and not confirmed and Path.nohitEligible() then
-        S.swingsNoHit = (S.swingsNoHit or 0) + 1
+    if not fired then
+        if Pin.active then Pin.park("click failed") end
+        return nil
     end
-    return did, confirmed, totalDamage
+    if Pin.afterClick then Pin.afterClick() end
+    if cfg.tapSpace then keyTap(Enum.KeyCode.Space, 0.02) end
+    -- Do not block the attack loop waiting 0.4 s for a hit. The meterTick task
+    -- owns the pending watch, so the configured swing interval is the cadence.
+    noteSwing(pullRan, healthBefore, swingPath, preWatch)
+    return swingPath, false, 0
 end
 
 local function watchdogTick()
-    local limit = math.max(5, tonumber(cfg.watchdogSwings) or 30)
-    if (S.swingsNoHit or 0) < limit then return end
-    S.swingsNoHit = 0
+    if cfg.countRegisters ~= true or HitSignal.registerAvailable ~= true then return end
+    local M = S.meter
+    local window = 30
+    if #M.recent < window then return end
+    local registered = 0
+    for index = #M.recent - window + 1, #M.recent do
+        if M.recent[index] and M.recent[index].registered then
+            registered = registered + 1
+        end
+    end
+    local ratio = registered / window
+    if ratio >= 0.2 then
+        S.watchdogStage, S.watchdogMsg = 0, nil
+        return
+    end
+    local now = clock()
+    if now - (S.watchdogAt or 0) < 15 then return end
+    S.watchdogAt = now
     S.watchdogStage = (S.watchdogStage or 0) + 1
     local stage = S.watchdogStage
     if stage == 1 then
-        Pin.stop("watchdog: re-pin")
+        if Pin.active then Pin.park("watchdog: re-park") end
         if S.target then S.target.nape = napeOf(S.target.model) end
-        S.watchdogMsg = "re-pin"
+        S.watchdogMsg = "re-park (registers low)"
     elseif stage == 2 then
-        if cfg.attackPath == "auto" then
-            Path.locked, Path.index = nil, 1
-            Path.advance()
-        end
-        S.watchdogMsg = "switch path to " .. tostring(Path.current())
-    elseif stage == 3 then
-        S.target = chooseTarget()
-        S.watchdogMsg = "switch target to " .. tostring(S.target and S.target.name or "none")
+        S.slashReleaseAt, S.nextSlashAt = nil, nil
+        S.watchdogMsg = "reset swing timing (registers low)"
     else
-        S.watchdogStage = 0
-        S.target = chooseTarget()
-        if S.target then
-            S.target.nape = napeOf(S.target.model)
-            Pin.stop("watchdog: re-target")
-            Pin.ensure(S.target)
+        local humanoid = S.target and S.target.model
+            and S.target.model:FindFirstChildOfClass("Humanoid")
+        local health = humanoid and humanoid.Health
+        if health ~= nil then
+            if S.wdHp ~= nil and health < S.wdHp - 0.5 then
+                S.wdHpDropAt = now
+            end
+            S.wdHp = health
         end
-        S.watchdogMsg = "re-target/re-pin " .. tostring(S.target and S.target.name or "none")
+        local losing = S.wdHpDropAt and now - S.wdHpDropAt < 3
+        if (M.zeroRegisterRun or 0) < 60 or losing then
+            S.watchdogStage = 2
+            S.watchdogMsg = losing and "hold: target losing health"
+                or "hold: need 60 zero-register swings"
+            say("watchdog: " .. tostring(S.watchdogMsg))
+            return
+        end
+        local newTarget = chooseTarget()
+        if newTarget and (not S.target or newTarget.model ~= S.target.model) then
+            S.target = newTarget
+            S.target.nape = napeOf(newTarget.model)
+            Pin.stop("watchdog: target switch")
+            if cfg.pinNape then Pin.ensure(S.target) end
+            M.zeroRegisterRun = 0
+            S.watchdogMsg = "switch target to " .. tostring(S.target and S.target.name or "none")
+        else
+            S.watchdogMsg = "target switch: no other target"
+        end
     end
     say("watchdog: " .. tostring(S.watchdogMsg))
 end
 
 local function attackTick()
     if not attackReady() then
-        if Pin.active then Pin.stop("pin: out of range") end
+        if Pin.active then Pin.park("pin: out of range") end
         return
     end
     local now = clock()
@@ -3722,7 +3946,6 @@ local function attackTick()
         pcall(applyNapes)
         task.wait()
     end
-    Path.retest()
     executeSwing(true, S.pullRan == true)
     watchdogTick()
 end
@@ -3932,6 +4155,8 @@ local function startFarm()
     Path.reset()
     S.pinActive, S.pinMsg, S.pinDrift = false, nil, 0
     S.swingsNoHit, S.watchdogStage, S.watchdogMsg = 0, 0, nil
+    S.registers, S.watchdogAt, S.wdHp, S.wdHpDropAt = 0, nil, nil, nil
+    S.swings, S.hits, S.kills = 0, 0, 0
     meterReset()
     S.owner, S.swingBoostUntil, S.swingVel = nil, nil, nil
     S.refillReason, S.refillMsg, S.refillPauseUntil = nil, nil, nil
@@ -4042,11 +4267,33 @@ local function statusText()
             S.kills or 0, S.swings or 0, S.hits or 0, S.pulls or 0,
             (S.kills or 0) / math.max(1, (clock() - (S.startedAt or clock())) / 60))
     end)
+    add("registers", function()
+        local M = S.meter or {}
+        local swings = M.swings or S.swings or 0
+        local regs = M.registers or S.registers or 0
+        local kills = S.kills or 0
+        local ratio = swings > 0 and regs / swings or 0
+        local perKill = kills > 0 and swings / kills or 0
+        local diag
+        if cfg.countRegisters ~= true then
+            diag = "register counter OFF"
+        elseif HitSignal.registerAvailable ~= true then
+            diag = "register counter unavailable: " .. tostring(HitSignal.registerReason or "?")
+        elseif ratio < 0.5 then
+            diag = "diagnosis: blade not overlapping nape (registers/swing < 0.5)"
+        elseif perKill > 30 and ratio >= 0.8 then
+            diag = "diagnosis: overlap good; low damage/speed"
+        else
+            diag = string.format("diagnosis: overlap %.2f", ratio)
+        end
+        return string.format("registers: %d   registers/swing: %.2f   swings/kill: %.1f   %s",
+            regs, ratio, perKill, diag)
+    end)
     add("damage", function()
         local M = S.meter or {}
-        return string.format("damage: %.1f total   %.2f/swing   last hit: %.1f   speed@swing: %.0f",
+        return string.format("damage: %.1f total   %.2f/swing   last hit: %.1f   speed@swing: last %.0f avg10 %.0f",
             M.damage or 0, (M.damage or 0) / math.max(1, M.swings or 0),
-            M.lastDamage or 0, M.lastSpeed or 0)
+            M.lastDamage or 0, M.lastSpeed or 0, M.avgSpeed or 0)
     end)
     add("drift", function()
         return string.format("drift: max %.1f last %.1f   joints: %d off / %d on   method: %s",
@@ -4081,6 +4328,7 @@ local function statusText()
     end)
     add("path", function()
         return "path: locked=" .. tostring(Path.locked or "none")
+            .. string.format("   cadence %.2fs", tonumber(cfg.swingInterval) or 0.20)
             .. "   " .. Path.summary()
             .. (Path.msg and ("   " .. tostring(Path.msg)) or "")
     end)
@@ -4195,7 +4443,7 @@ local function buildUI()
     title.Size = UDim2.new(1, -30, 1, 0)
     title.Position = UDim2.fromOffset(10, 0)
     title.BackgroundTransparency = 1
-    title.Text = "AOTR internal  v" .. VERSION
+    title.Text = "AOTR internal  v" .. VERSION .. "  b" .. (BUILD:match("%.(%d+)$") or "?")
     title.TextColor3 = Color3.fromRGB(226, 218, 255)
     title.Font = Enum.Font.GothamMedium
     title.TextSize = 13
@@ -4390,6 +4638,14 @@ local function buildUI()
     end)
     addLabel(body, "P starts/stops. RightControl hides this panel.")
     addToggle(body, "Pin nape", "pinNape")
+    addSlider(body, "Speed cap", "speedCap", 200, 1500, 25)
+    addSlider(body, "Fall clamp", "fallLimit", 0, 100, 5)
+    addToggle(body, "Tap Space", "tapSpace")
+    addToggle(body, "Count registers", "countRegisters")
+    addToggle(body, "Fresh overlap", "freshOverlap")
+    addSlider(body, "Hold on player", "holdOnPlayer", 0.05, 0.40, 0.01)
+    addSlider(body, "Swing interval", "swingInterval", 0.12, 0.40, 0.01)
+
     addButton(body, "Attack path: " .. tostring(cfg.attackPath), function(button)
         local paths = { "auto", "gui", "remote", "mouse" }
         local current = 1
@@ -4481,6 +4737,7 @@ function AOTR.destroy()
     pcall(Exit.stop)
     clearActive()
     if genv.AOTR == AOTR then genv.AOTR = nil end
+    HitSignal.hookActive = false
 end
 
 local function toggleFarm()
@@ -4585,6 +4842,17 @@ safeSpawn(function()
 end, "auto start")
 
 Net.bind()
+-- Assets can stream in after this script starts. Retry only the missing-POST
+-- case; an executor without hookmetamethod must not spin here.
+safeSpawn(function()
+    for _ = 1, 90 do
+        if HitSignal.registerAvailable then return end
+        local reason = tostring(HitSignal.registerReason or "")
+        if reason ~= "" and not string.find(reason, "POST", 1, true) then return end
+        pcall(HitSignal.installRegisterHook)
+        task.wait(2)
+    end
+end)
 safeSpawn(function()
     for _ = 1, 90 do
         if Net.get and Net.post then return end

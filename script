@@ -14,7 +14,7 @@ if type(Net) ~= "table" then Net = {} end
 
 local lp = nil
 local VERSION = "2.9"
-local BUILD = "2.9+autoexec.16"
+local BUILD = "2.9+autoexec.17"
 local CFG_FILE = "aotr_internal_cfg.json"
 -- Autoexecute loads this remote script on reinject and after a teleport.
 local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/Iamkira257/aotr2/refs/heads/main/script"
@@ -2427,7 +2427,7 @@ local function pruneNapes()
     end
 end
 --============================================================================
-local Hover = { base = nil, goal = nil, face = nil, conn = nil, phase = 0, wasOwner = false }
+local Hover = { base = nil, goal = nil, face = nil, conn = nil, phase = 0, wasOwner = false, transition = false }
 
 local function setOwner(name)
     S.owner = name
@@ -2474,7 +2474,18 @@ local function hoverStep(dt)
     end
 
     pcall(function()
-        root.CFrame = CFrame.new(goal) * rotation
+        local targetCFrame = CFrame.new(goal) * rotation
+        local distance = (root.CFrame.Position - goal).Magnitude
+        if distance > 50 then Hover.transition = true end
+        if Hover.transition and distance > 2 then
+            -- Target switches and refill returns can move the hover point far
+            -- away. Keep blending until the character is close, otherwise the
+            -- final snap still jerks the camera.
+            root.CFrame = root.CFrame:Lerp(targetCFrame, 0.25)
+        else
+            Hover.transition = false
+            root.CFrame = targetCFrame
+        end
         local velocity = root.AssemblyLinearVelocity
         if cfg.zeroVelocity then
             if S.swingBoostUntil and clock() < S.swingBoostUntil then
@@ -2510,6 +2521,7 @@ local function hoverStop()
     Hover.conn = nil
     Hover.goal, Hover.base, Hover.face = nil, nil, nil
     Hover.wasOwner = false
+    Hover.transition = false
     S.owner = nil
     S.swingBoostUntil = nil
 end
@@ -2529,17 +2541,10 @@ local function hoverAt(root, point, height)
 end
 
 local function aimAt(root, camera, point)
-    -- Off by default: the 10 Hz camera write fights the player's own camera and
-    -- was the source of the shake. cameraLock turns it back on deliberately.
-    if not cfg.cameraLock then return end
-    if camera then
-        pcall(function()
-            local from = camera.CFrame.Position
-            if (point - from).Magnitude > 0.05 then
-                camera.CFrame = CFrame.lookAt(from, point)
-            end
-        end)
-    end
+    -- Camera CFrame writes are intentionally disabled. Forcing the camera
+    -- fights Roblox's default camera controller and causes the rare
+    -- camera/FOV snap. The farm does not need the camera to be aimed.
+    return
 end
 
 local function travel(point)

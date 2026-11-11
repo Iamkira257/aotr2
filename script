@@ -2837,7 +2837,10 @@ local function refillTick(now, root)
     if Refill.lastSets ~= nil and sets ~= Refill.lastSets then changed = true end
     if Refill.lastDurability ~= nil and durability ~= Refill.lastDurability then changed = true end
     if changed and (S.reloading or S.refilling) then
-        Refill.settleUntil = math.max(Refill.settleUntil or 0, now + 1)
+        -- A reload can resume as soon as the new blade set is readable. Do not
+        -- hold it behind the refill bar's one-second tween.
+        local settle = S.reloading and 0.05 or 1
+        Refill.settleUntil = math.max(Refill.settleUntil or 0, now + settle)
         Refill.reloadNextPress = math.max(Refill.reloadNextPress or 0, Refill.settleUntil)
         Refill.nextPress = math.max(Refill.nextPress or 0, Refill.settleUntil)
     end
@@ -2848,7 +2851,6 @@ local function refillTick(now, root)
 
     if S.refilling then
         Refill.maxSets = refillMaxSets(hudText)
-        if not S.running then return refillCancel("refill cancelled - farm stopped") end
         if cfg.refill ~= true then return refillCancel("refill cancelled - auto refill OFF") end
         if S.results then return refillCancel("refill cancelled - results screen") end
         if currentKind() ~= "mission" then return refillCancel("refill cancelled - not in mission") end
@@ -2866,7 +2868,8 @@ local function refillTick(now, root)
             Refill.cycles, Refill.tries = 0, 0
             S.refilling = false
             Refill.until_ = now + 2
-            Refill.settleUntil = now + 1
+            -- The station hold is released above; resume attacking now.
+            Refill.settleUntil = now + 0.05
             setOwner(nil)
             S.state = string.format("refilled (sets %d/%d, durability %.2f)",
                 sets, Refill.maxSets, durability)
@@ -2933,7 +2936,9 @@ local function refillTick(now, root)
         local dropped = sets ~= nil and Refill.reloadSets ~= nil and sets < Refill.reloadSets
         if (durability ~= nil and durability >= 0.99) or (durability == nil and dropped) then
             S.reloading = false
-            Refill.settleUntil = now + 1
+            -- No one-second settle after a successful reload: the attack loop
+            -- can resume on its next tick.
+            Refill.settleUntil = now + 0.05
             Refill.cycles, Refill.tries = 0, 0
             Refill.reloadStarted, Refill.reloadNextPress, Refill.reloadTries = 0, 0, 0
             S.state = string.format("reloaded (sets %s, dropped=%s, durability %s)",
@@ -3470,7 +3475,8 @@ local function retryVerify(beforeLabel, button)
 end
 
 local function retryTick(now)
-    if now - (S.startedAt or now) < 1.5 then return end
+    local startedAt = S.startedAt or BOOT.startedAt or now
+    if now - startedAt < 1.5 then return end
     local signature = resultsSignature()
     if not signature then
         S.results = false
@@ -3485,7 +3491,7 @@ local function retryTick(now)
         S.results = true
         Exit.results(signature)
     end
-    if not cfg.autoRetry or not S.running then return end
+    if not cfg.autoRetry then return end
     local gap = math.max(0.5, math.min(2, tonumber(cfg.retryCooldown) or 1))
     if Retry.last and now - Retry.last < gap then return end
     Retry.active = true
@@ -4214,6 +4220,26 @@ local function stopFarm()
     refreshControls()
     return true
 end
+
+-- Auto reload/refill/retry are standalone helpers. They keep running while the
+-- farm itself is stopped, including after the user toggles Auto farm off.
+safeSpawn(function()
+    while true do
+        task.wait(0.1)
+        if not S.running then
+            local now = clock()
+            local okRetry, retryErr = pcall(retryTick, now)
+            if not okRetry then setError("auto retry", retryErr) end
+            local _, root, humanoid = myChar()
+            local active = S.refilling or S.reloading
+            local healthy = humanoid and humanoid.Health > 0
+            if root and (active or (healthy and not S.results)) then
+                local okRefill, refillErr = pcall(refillTick, now, root)
+                if not okRefill then setError("auto reload/refill", refillErr) end
+            end
+        end
+    end
+end, "standby maintenance")
 
 --============================================================================
 --  STATUS

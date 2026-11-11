@@ -1,0 +1,4599 @@
+--============================================================================
+--  ATTACK ON TITAN REVOLUTION  |  INTERNAL EXECUTOR BUILD
+--  Lean farm: combat, reload/refill, minimal retry, flight recorder.
+--============================================================================
+
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local HttpService  = game:GetService("HttpService")
+local UserInput    = game:GetService("UserInputService")
+local Replicated   = game:GetService("ReplicatedStorage")
+
+local lp = nil
+local VERSION = "2.9"
+local BUILD = "2.9+autoexec.4"
+local CFG_FILE = "aotr_internal_cfg.json"
+-- aotr_run.lua writes this exact copy; the autoexec loader runs it on relaunch.
+local SOURCE_FILE = "aotr_internal_src.lua"
+local LOG_FILE = "aotr_autoexec_log.txt"
+local RUN_FILE = "aotr_run.lua"
+
+local genv = getgenv()
+local S
+local BOOT = {
+    startedAt = os.clock(), stage = "game", ready = false,
+    failed = nil, lastError = nil, started = false, elapsed = nil,
+}
+local SERVER_KEY = tostring(game.JobId or "")
+if SERVER_KEY == "" then SERVER_KEY = "place:" .. tostring(game.PlaceId) end
+local ACTIVE_TOKEN = tostring(os.clock()) .. ":" .. SERVER_KEY .. ":"
+    .. tostring(math.random(1, 1000000000))
+
+local function writeLog(line)
+    pcall(function()
+        local text = string.format("[%s] %s\n",
+            os.date("%Y-%m-%d %H:%M:%S"), tostring(line))
+        if type(appendfile) == "function" then
+            local okAppend = pcall(appendfile, LOG_FILE, text)
+            if okAppend then return end
+        end
+        if type(writefile) ~= "function" then return end
+        local old = ""
+        if type(readfile) == "function" then
+            pcall(function() old = readfile(LOG_FILE) or "" end)
+        end
+        if #old > 32768 then old = old:sub(-32768) end
+        writefile(LOG_FILE, old .. text)
+    end)
+end
+
+local function setError(label, err)
+    local message = tostring(label or "error") .. ": " .. tostring(err)
+    BOOT.lastError = message
+    if S then S.err = message end
+    writeLog("ERROR " .. message)
+end
+
+local function safe(fn, label)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then setError(label or "callback", err) end
+        return ok
+    end
+end
+
+local function safeSpawn(fn, label)
+    return task.spawn(safe(fn, label or "task"))
+end
+
+function BOOT.describe()
+    local elapsed = math.max(0, os.clock() - (BOOT.startedAt or os.clock()))
+    if BOOT.started then
+        return string.format("started in %.1fs", BOOT.elapsed or elapsed)
+    end
+    if BOOT.failed then
+        return string.format("failed - %s (%.1fs)", tostring(BOOT.failed), elapsed)
+    end
+    if BOOT.stage == "auto farm OFF" then return "idle - auto farm OFF" end
+    if BOOT.stage == "starting" then
+        return string.format("starting farm (%.1fs)", elapsed)
+    end
+    if BOOT.stage == "Interface" or BOOT.ready == true then
+        return string.format("waiting for Interface (%.1fs)", elapsed)
+    end
+    return string.format("waiting for %s (%.1fs)", tostring(BOOT.stage or "game"), elapsed)
+end
+
+local function clearActive()
+    local active = genv.AOTR_ACTIVE
+    if type(active) == "table" and active.token == ACTIVE_TOKEN then
+        active.alive = false
+        genv.AOTR_ACTIVE = nil
+    end
+end
+
+local function activeIsLive(active)
+    if type(active) ~= "table" or active.alive == false then return false end
+    if active.build ~= BUILD or active.job ~= SERVER_KEY then return false end
+    local now = os.clock()
+    local beat = type(active.heartbeat) == "number"
+        and now >= active.heartbeat and (now - active.heartbeat) < 10
+    local registered = type(genv.AOTR) == "table"
+        and genv.AOTR._token == active.token and genv.AOTR._job == SERVER_KEY
+    return beat or registered
+end
+
+-- A queue copy and the autoexec loader can both fire. The first live copy wins;
+-- every later copy exits here before it can stop or restart the first one.
+local existing = genv.AOTR_ACTIVE
+if activeIsLive(existing) then
+    writeLog("duplicate copy exited: active token " .. tostring(existing.token))
+    return
+end
+
+-- A queued copy marks itself before this chunk runs. Do not load anything if the
+-- saved toggle is OFF or this server already ran the queued copy.
+if genv.AOTR_QUEUED_RUN == true then
+    genv.AOTR_QUEUED_RUN = nil
+    local saved = nil
+    if type(isfile) == "function" and type(readfile) == "function" then
+        local okRead, raw = pcall(readfile, CFG_FILE)
+        if okRead and type(raw) == "string" then
+            local okDecode, value = pcall(function() return HttpService:JSONDecode(raw) end)
+            if okDecode and type(value) == "table" then saved = value end
+        end
+    end
+    if not saved or saved.autoExecute ~= true then
+        writeLog("queued run skipped: autoExecute off")
+        return
+    end
+    local jobs = genv.AOTR_STUB_JOBS
+    if type(jobs) == "table" and jobs[SERVER_KEY] then
+        writeLog("queued run skipped: duplicate in this server")
+        return
+    end
+    if type(jobs) ~= "table" then
+        jobs = {}
+        genv.AOTR_STUB_JOBS = jobs
+    end
+    jobs[SERVER_KEY] = true
+end
+
+local bootStartedAt = os.clock()
+genv.AOTR_ACTIVE = {
+    token = ACTIVE_TOKEN, job = SERVER_KEY, build = BUILD,
+    startedAt = bootStartedAt, heartbeat = bootStartedAt, alive = true,
+}
+
+safeSpawn(function()
+    local deadline = os.clock() + 300
+    while os.clock() < deadline do
+        local active = genv.AOTR_ACTIVE
+        if type(active) ~= "table" or active.token ~= ACTIVE_TOKEN then return end
+        active.heartbeat = os.clock()
+        task.wait(2)
+    end
+end, "heartbeat")
+
+writeLog("boot " .. BUILD .. " waiting game")
+BOOT.stage = "game"
+local gameOk, gameDeadline = false, os.clock() + 30
+while os.clock() < gameDeadline do
+    local ok, loaded = pcall(function() return game:IsLoaded() end)
+    if ok and loaded then gameOk = true break end
+    task.wait(0.25)
+end
+if not gameOk then
+    BOOT.failed = "game not loaded in 30s"
+    writeLog("autostart: failed - game not loaded in 30s")
+end
+
+BOOT.stage = "player"
+writeLog("boot waiting player")
+local player, playerDeadline = nil, os.clock() + 30
+while os.clock() < playerDeadline do
+    local ok, found = pcall(function() return Players.LocalPlayer end)
+    if ok and found then player = found break end
+    task.wait(0.25)
+end
+if not player then
+    BOOT.failed = "LocalPlayer timeout"
+    BOOT.stage = "player"
+    writeLog("autostart: failed - LocalPlayer timeout")
+    clearActive()
+    return
+end
+lp = player
+
+BOOT.stage = "PlayerGui"
+writeLog("boot waiting PlayerGui")
+local readyGui = nil
+pcall(function() readyGui = lp:WaitForChild("PlayerGui", 30) end)
+if readyGui then
+    BOOT.ready = true
+    BOOT.stage = gameOk and "Interface" or "game"
+    if gameOk then BOOT.failed = nil end
+    writeLog("boot PlayerGui ready")
+else
+    BOOT.ready = false
+    BOOT.failed = "PlayerGui timeout"
+    BOOT.stage = "PlayerGui"
+    writeLog("autostart: failed - PlayerGui timeout")
+end
+
+local previous = genv.AOTR
+if type(previous) == "table" then
+    if type(previous.stop) == "function" then pcall(previous.stop) end
+    if type(previous.destroy) == "function" then pcall(previous.destroy) end
+    pcall(function()
+        if previous._gui then previous._gui:Destroy() end
+    end)
+end
+if genv.AOTR_hotkey then
+    pcall(function() genv.AOTR_hotkey:Disconnect() end)
+    genv.AOTR_hotkey = nil
+end
+if genv.AOTR_queue then
+    pcall(function() genv.AOTR_queue:Disconnect() end)
+    genv.AOTR_queue = nil
+end
+
+local function probe(fn, ...)
+    local ok, value = pcall(fn, ...)
+    if ok then return value end
+    return nil
+end
+
+-- Every later path uses these instead of trusting a cached LocalPlayer or a GUI
+-- tree that may still be loading. They return nil instead of throwing.
+local function getPlayerGui()
+    if not lp then return nil end
+    local ok, gui = pcall(function() return lp:FindFirstChild("PlayerGui") end)
+    if ok then return gui end
+    return nil
+end
+
+local function localChar()
+    if not lp then return nil end
+    local ok, char = pcall(function() return lp.Character end)
+    if ok then return char end
+    return nil
+end
+
+local function currentCamera()
+    local ok, camera = pcall(function() return workspace.CurrentCamera end)
+    if ok then return camera end
+    return nil
+end
+
+local caps = {
+    firesignal     = type(firesignal) == "function",
+    getconnections = type(getconnections) == "function",
+    prompt         = type(fireproximityprompt) == "function",
+    mouse1click    = type(mouse1click) == "function",
+    mouse1press    = type(mouse1press) == "function",
+    mouse1release  = type(mouse1release) == "function",
+    keypress       = type(keypress) == "function",
+    keyrelease     = type(keyrelease) == "function",
+    gethui         = type(gethui) == "function",
+    writefile      = type(writefile) == "function",
+    readfile       = type(readfile) == "function",
+    isfile         = type(isfile) == "function",
+    appendfile     = type(appendfile) == "function",
+    getclipboard   = type(getclipboard) == "function",
+}
+caps.vim = probe(function() return game:GetService("VirtualInputManager") end)
+if not caps.vim then
+    caps.vim = probe(function() return getgenv().VirtualInputManager end)
+end
+if not caps.vim then caps.vim = false end
+
+
+local cfg = {
+    autoFarm       = false,
+    priority       = "nearest",
+    hover          = 200,
+    attackHz       = 20,
+    attackDelay    = 0.06,
+    attackPath     = "auto",
+    tapSpace       = false,
+    cameraLock     = false,
+    swingSpeed     = 0,
+    zeroVelocity   = false,
+    fallLimit      = 45,
+    napeEnabled    = true,
+    napeMult       = 6,
+    napeRange      = 900,
+    magnet         = false,
+    magnetSize     = 15,
+    magnetY        = 2,
+    pullDetach     = "disable",
+    pullWait       = 0,
+    pullNoCollide  = false,
+    pinNape        = true,
+    pinDrift       = 3,
+    remoteTemplate = true,
+    hitSignal      = "auto",
+    watchdogSwings = 30,
+    multiHit       = true,
+    multiRadius    = 45,
+    multiMin       = 2,
+    refill         = true,
+    autoReload     = true,
+    refillTries    = 6,
+    refillCooldown = 12,
+    refillMethod   = "auto",
+    autoRetry      = true,
+    autoExecute    = false,
+    refillHold     = 3,
+    retryCooldown  = 25,
+    retryVerify    = 5,
+    tick           = 0.05,
+    bobAmp         = 2,
+    bobHz          = 1.5,
+}
+
+local PERSIST = {
+    "priority", "hover", "attackHz", "attackDelay", "attackPath", "tapSpace",
+    "cameraLock", "swingSpeed", "zeroVelocity", "fallLimit",
+    "napeEnabled", "napeMult", "napeRange", "magnet", "magnetSize", "magnetY",
+    "pullDetach", "pullWait", "pullNoCollide", "pinNape", "pinDrift",
+    "remoteTemplate", "hitSignal", "watchdogSwings", "multiHit", "multiRadius",
+    "multiMin", "refill", "autoReload", "refillTries", "refillHold",
+    "refillCooldown", "refillMethod", "autoRetry", "retryCooldown",
+    "retryVerify", "tick", "bobAmp", "bobHz", "autoFarm", "autoExecute",
+}
+
+-- autoFarm is saved only when the player changes it (panel toggle or P). Plain
+-- saves keep the remembered value, so the re-execute stop cannot wipe an ON.
+local autoFarmSaved = false
+
+local function saveCfg(markAutoFarm)
+    if not caps.writefile then return false end
+    if markAutoFarm then autoFarmSaved = cfg.autoFarm == true end
+    local out = {}
+    for _, key in ipairs(PERSIST) do out[key] = cfg[key] end
+    out.autoFarm = autoFarmSaved
+    local ok, encoded = pcall(function() return HttpService:JSONEncode(out) end)
+    if not ok then return false end
+    return (pcall(writefile, CFG_FILE, encoded))
+end
+
+local function loadCfg()
+    if not (caps.isfile and caps.readfile) then return end
+    local okFile = pcall(isfile, CFG_FILE)
+    if not okFile or not isfile(CFG_FILE) then return end
+    local ok, source = pcall(readfile, CFG_FILE)
+    if not ok or type(source) ~= "string" then return end
+    local okDecode, saved = pcall(function() return HttpService:JSONDecode(source) end)
+    if not okDecode or type(saved) ~= "table" then return end
+    for _, key in ipairs(PERSIST) do
+        if saved[key] ~= nil then cfg[key] = saved[key] end
+    end
+    autoFarmSaved = cfg.autoFarm == true
+end
+
+loadCfg()
+
+--============================================================================
+--  AUTO EXECUTE
+--============================================================================
+local AutoExec = {
+    queueName = nil, sourceText = nil, sourceMethod = nil, sourceOk = false,
+    sourceBytes = nil, savedOn = nil, savedAt = nil, checkedAt = nil,
+    captured = false, queueCount = 0, lastAt = nil, reason = nil, queuedFor = nil,
+    compileOk = nil, compileErr = nil, queueBytes = nil, testText = nil,
+}
+
+local function jobKey()
+    local id = tostring(game.JobId or "")
+    if id == "" then id = "place:" .. tostring(game.PlaceId) end
+    return id
+end
+
+local function jobTable()
+    local env = nil
+    pcall(function() env = getgenv() end)
+    if type(env) ~= "table" then return nil end
+    local jobs = env.AOTR_STUB_JOBS
+    if type(jobs) ~= "table" then
+        jobs = {}
+        env.AOTR_STUB_JOBS = jobs
+    end
+    return jobs
+end
+
+local function readSavedFlag(key)
+    if not (caps.isfile and caps.readfile) then return nil end
+    local ok, exists = pcall(isfile, CFG_FILE)
+    if not ok or not exists then return nil end
+    local okRead, raw = pcall(readfile, CFG_FILE)
+    if not okRead or type(raw) ~= "string" then return nil end
+    local okDecode, saved = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not okDecode or type(saved) ~= "table" then return nil end
+    return saved[key]
+end
+
+local function autoLog(line)
+    if not caps.writefile then return end
+    pcall(function()
+        local text = string.format("[%s] %s\n", os.date("%Y-%m-%d %H:%M:%S"), tostring(line))
+        if caps.appendfile then
+            appendfile(LOG_FILE, text)
+            return
+        end
+        if not caps.readfile then return end
+        local old = ""
+        pcall(function()
+            if not caps.isfile or isfile(LOG_FILE) then old = readfile(LOG_FILE) or "" end
+        end)
+        if #old > 32768 then old = old:sub(-32768) end
+        pcall(writefile, LOG_FILE, old .. text)
+    end)
+end
+
+-- Return the queue function and the name shown on the panel.
+local function queueFn()
+    local candidates = {
+        { "queue_on_teleport", function() return queue_on_teleport end },
+        { "syn.queue_on_teleport", function() return syn and syn.queue_on_teleport end },
+        { "fluxus.queue_on_teleport", function() return fluxus and fluxus.queue_on_teleport end },
+        { "queueonteleport", function() return queueonteleport end },
+    }
+    for _, entry in ipairs(candidates) do
+        local ok, fn = pcall(entry[2])
+        if ok and type(fn) == "function" then return fn, entry[1] end
+    end
+    return nil, nil
+end
+
+local function sourceHint()
+    return "paste " .. RUN_FILE .. " once"
+end
+
+-- The runner and the queued chunk both start with their own marker. Do not
+-- mistake either wrapper for the main chunk when capturing text.
+local function isMainSource(value)
+    if type(value) ~= "string" or #value < 1000 then return false end
+    local head = value:sub(1, 200)
+    if head:find("AOTR_RUN_WRAPPER", 1, true) then return false end
+    if head:find("AOTR_QUEUE_WRAPPER", 1, true) then return false end
+    return value:find("AOTR internal", 1, true) ~= nil
+        and value:find("local function buildQueueText", 1, true) ~= nil
+end
+
+function AutoExec.checkSource(force)
+    if AutoExec.sourceText and not force then return true end
+    if AutoExec.captured and not force then return AutoExec.sourceOk == true end
+    AutoExec.captured = true
+    AutoExec.sourceText, AutoExec.sourceMethod, AutoExec.sourceBytes = nil, nil, nil
+    AutoExec.sourceOk = false
+    AutoExec.compileOk, AutoExec.compileErr, AutoExec.queueBytes = nil, nil, nil
+
+    local env = nil
+    pcall(function() env = getgenv() end)
+    local carried = type(env) == "table" and env.AOTR_SOURCE or nil
+    if isMainSource(carried) then
+        AutoExec.sourceText = carried
+        AutoExec.sourceMethod = tostring(env.AOTR_SOURCE_METHOD or "aotr_run.lua")
+    else
+        local info = nil
+        pcall(function() info = debug.getinfo(1, "S") end)
+        local dbg = info and info.source or nil
+        if isMainSource(dbg) then
+            AutoExec.sourceText = dbg
+            AutoExec.sourceMethod = "debug.getinfo"
+        elseif caps.getclipboard then
+            local ok, clip = pcall(getclipboard)
+            if ok and isMainSource(clip) then
+                AutoExec.sourceText = clip
+                AutoExec.sourceMethod = "clipboard"
+            end
+        end
+    end
+
+    if AutoExec.sourceText then
+        AutoExec.sourceOk = true
+        AutoExec.sourceBytes = #AutoExec.sourceText
+        autoLog(string.format("source found via %s (%d B)",
+            tostring(AutoExec.sourceMethod), AutoExec.sourceBytes))
+    else
+        autoLog("source not found - " .. sourceHint())
+    end
+    return AutoExec.sourceOk
+end
+
+-- Chunked save used by the runner fallback and the loader path. Every write is
+-- pcall'ed, and the file is read back so a partial write cannot leave a broken copy.
+function AutoExec.writeSource(source)
+    if not caps.writefile then return false, "no writefile in this executor" end
+    local chunk = 16000
+    local size = #source
+    if size <= chunk or not caps.appendfile then
+        local ok, err = pcall(writefile, SOURCE_FILE, source)
+        if not ok then return false, "writefile: " .. tostring(err) end
+    else
+        local ok, err = pcall(writefile, SOURCE_FILE, source:sub(1, chunk))
+        if not ok then return false, "writefile: " .. tostring(err) end
+        local at = chunk + 1
+        while at <= size do
+            local okPart, errPart = pcall(appendfile, SOURCE_FILE, source:sub(at, at + chunk - 1))
+            if not okPart then
+                return false, string.format("appendfile at byte %d: %s", at, tostring(errPart))
+            end
+            at = at + chunk
+        end
+    end
+    if caps.isfile then
+        local okExists, exists = pcall(isfile, SOURCE_FILE)
+        if not okExists or not exists then return false, "file missing after write" end
+    end
+    if not caps.readfile then return true end
+    local okRead, back = pcall(readfile, SOURCE_FILE)
+    if not okRead or type(back) ~= "string" then return false, "read back failed" end
+    if #back ~= size then
+        return false, string.format("size mismatch: wrote %d, read %d", size, #back)
+    end
+    return true
+end
+
+function AutoExec.ensureSaved()
+    if type(AutoExec.sourceText) ~= "string" or AutoExec.sourceText == "" then
+        return false, "no source"
+    end
+    if not caps.writefile then return false, "no writefile in this executor" end
+    if caps.isfile and caps.readfile then
+        local okExists, exists = pcall(isfile, SOURCE_FILE)
+        if okExists and exists then
+            local okRead, back = pcall(readfile, SOURCE_FILE)
+            if okRead and type(back) == "string" and #back == #AutoExec.sourceText then
+                return true
+            end
+        end
+    end
+    local ok, why = AutoExec.writeSource(AutoExec.sourceText)
+    if ok then
+        autoLog(string.format("saved exact source to %s (%d B)", SOURCE_FILE, #AutoExec.sourceText))
+    else
+        autoLog("save source failed: " .. tostring(why))
+    end
+    return ok, why
+end
+
+-- Build the exact chunk passed to queue_on_teleport. The source sits in one
+-- long string, so the queued run gets the same text and the same source method.
+local function buildQueueText()
+    local source = AutoExec.sourceText
+    if type(source) ~= "string" or source == "" then return nil, "no source" end
+    local body = source
+    if body:sub(-1) ~= "\n" then body = body .. "\n" end
+    local equals = 3
+    while body:find("]" .. string.rep("=", equals) .. "]", 1, true) do
+        equals = equals + 1
+    end
+    local open = "[" .. string.rep("=", equals) .. "["
+    local close = "]" .. string.rep("=", equals) .. "]"
+    local text = table.concat({
+        "-- AOTR_QUEUE_WRAPPER",
+        "local AOTR_QUEUE_LOG = " .. string.format("%q", LOG_FILE),
+        "local AOTR_QUEUE_SOURCE = " .. open,
+        body .. close,
+        "local ok, err = pcall(function()",
+        "    getgenv().AOTR_SOURCE = AOTR_QUEUE_SOURCE",
+        "    getgenv().AOTR_SOURCE_METHOD = 'queued'",
+        "    getgenv().AOTR_QUEUED_RUN = true",
+        "    local fn, compileErr = loadstring(AOTR_QUEUE_SOURCE)",
+        "    if not fn then error(compileErr) end",
+        "    return fn()",
+        "end)",
+        "if not ok then",
+        "    pcall(function()",
+        "        local line = string.format('[%s] queued run error: %s\\n', os.date('%Y-%m-%d %H:%M:%S'), tostring(err))",
+        "        if type(appendfile) == 'function' then appendfile(AOTR_QUEUE_LOG, line)",
+        "        elseif type(writefile) == 'function' then writefile(AOTR_QUEUE_LOG, line) end",
+        "    end)",
+        "end",
+    }, "\n")
+    return text
+end
+
+function AutoExec.compile(force)
+    if AutoExec.compileOk ~= nil and not force then
+        return AutoExec.compileOk, AutoExec.compileErr
+    end
+    AutoExec.compileOk, AutoExec.compileErr, AutoExec.queueBytes = nil, nil, nil
+    local source = AutoExec.sourceText
+    if type(source) ~= "string" then
+        AutoExec.compileOk = false
+        AutoExec.compileErr = "no source"
+        return false, AutoExec.compileErr
+    end
+    if type(loadstring) ~= "function" then
+        AutoExec.compileOk = false
+        AutoExec.compileErr = "no compiler in this executor"
+        return false, AutoExec.compileErr
+    end
+    local okSrc, fnSrc, errSrc = pcall(loadstring, source)
+    if not okSrc then
+        AutoExec.compileOk = false
+        AutoExec.compileErr = tostring(fnSrc)
+        return false, AutoExec.compileErr
+    end
+    if not fnSrc then
+        AutoExec.compileOk = false
+        AutoExec.compileErr = tostring(errSrc)
+        return false, AutoExec.compileErr
+    end
+    local queueText, why = buildQueueText()
+    if not queueText then
+        AutoExec.compileOk = false
+        AutoExec.compileErr = tostring(why)
+        return false, AutoExec.compileErr
+    end
+    local okQueue, fnQueue, errQueue = pcall(loadstring, queueText)
+    if not okQueue then
+        AutoExec.compileOk = false
+        AutoExec.compileErr = tostring(fnQueue)
+        return false, AutoExec.compileErr
+    end
+    if not fnQueue then
+        AutoExec.compileOk = false
+        AutoExec.compileErr = tostring(errQueue)
+        return false, AutoExec.compileErr
+    end
+    AutoExec.queueBytes = #queueText
+    AutoExec.compileOk = true
+    AutoExec.compileErr = nil
+    return true
+end
+
+function AutoExec.test()
+    AutoExec.checkSource(true)
+    if AutoExec.sourceOk then pcall(AutoExec.ensureSaved) end
+    local fn, name = queueFn()
+    AutoExec.queueName = name
+    local savedFlag = readSavedFlag("autoExecute")
+    AutoExec.savedOn = savedFlag == true
+    AutoExec.savedAt = os.clock()
+    local compiled, compileWhy = AutoExec.compile(true)
+
+    local sourceText
+    if AutoExec.sourceOk then
+        sourceText = string.format("%s %d B",
+            tostring(AutoExec.sourceMethod or "source"), AutoExec.sourceBytes or 0)
+    else
+        sourceText = "none"
+    end
+
+    local plan
+    if not AutoExec.sourceOk then
+        plan = "no source - " .. sourceHint()
+    elseif not name then
+        plan = "no queue_on_teleport in this executor"
+    elseif not compiled then
+        plan = "compile failed"
+    elseif savedFlag ~= true then
+        plan = "would not run: saved autoExecute OFF"
+    elseif AutoExec.queuedFor == jobKey() then
+        plan = "already queued for this server"
+    else
+        plan = "would queue; new server runs, same server exits duplicate"
+    end
+
+    AutoExec.testText = string.format("test: src %s | %s | saved %s | queue %s | %s",
+        sourceText,
+        compiled and "compiles OK" or ("compile error: " .. tostring(compileWhy)),
+        savedFlag == nil and "?" or (savedFlag and "ON" or "OFF"),
+        tostring(name or "none"),
+        plan)
+    autoLog(AutoExec.testText)
+    return AutoExec.testText
+end
+
+function AutoExec.refresh()
+    AutoExec.checkSource()
+    AutoExec.checkedAt = os.clock()
+    local fn, name = queueFn()
+    AutoExec.queueName = name
+    local savedFlag = readSavedFlag("autoExecute")
+    if savedFlag == nil then AutoExec.savedOn = nil else AutoExec.savedOn = savedFlag == true end
+    AutoExec.savedAt = os.clock()
+
+    if cfg.autoExecute ~= true then
+        AutoExec.reason = nil
+        return false
+    end
+    if not fn then
+        AutoExec.reason = "no queue_on_teleport in this executor"
+        autoLog("queue failed: " .. AutoExec.reason)
+        return false
+    end
+    if not AutoExec.sourceOk then
+        AutoExec.reason = "source not found - " .. sourceHint()
+        autoLog("queue failed: " .. AutoExec.reason)
+        return false
+    end
+    local compiled, compileWhy = AutoExec.compile()
+    if not compiled then
+        AutoExec.reason = "queue text does not compile: " .. tostring(compileWhy)
+        autoLog("queue failed: " .. AutoExec.reason)
+        return false
+    end
+    local key = jobKey()
+    if AutoExec.queuedFor == key then return true end
+
+    local queueText, why = buildQueueText()
+    if not queueText then
+        AutoExec.reason = tostring(why)
+        autoLog("queue failed: " .. AutoExec.reason)
+        return false
+    end
+    local ok, err = pcall(fn, queueText)
+    if not ok then
+        AutoExec.reason = "queue failed: " .. tostring(err)
+        autoLog("queue failed: " .. AutoExec.reason)
+        return false
+    end
+    AutoExec.queuedFor = key
+    AutoExec.queueCount = AutoExec.queueCount + 1
+    AutoExec.lastAt = os.date("%H:%M:%S")
+    AutoExec.reason = nil
+    autoLog(string.format("queued x%d for job=%s via %s, src %s %d B, queue %d B",
+        AutoExec.queueCount, key, tostring(name), tostring(AutoExec.sourceMethod or "?"),
+        AutoExec.sourceBytes or 0, AutoExec.queueBytes or 0))
+    return true
+end
+
+function AutoExec.describe()
+    local now = os.clock()
+    if not AutoExec.checkedAt or now - AutoExec.checkedAt > 5 then
+        AutoExec.checkSource()
+        AutoExec.checkedAt = now
+    end
+    if not AutoExec.savedAt or now - AutoExec.savedAt > 2 then
+        local savedFlag = readSavedFlag("autoExecute")
+        if savedFlag == nil then AutoExec.savedOn = nil else AutoExec.savedOn = savedFlag == true end
+        AutoExec.savedAt = now
+    end
+    local sourceText
+    if AutoExec.sourceOk then
+        sourceText = string.format("%s %d B",
+            tostring(AutoExec.sourceMethod or "source"), AutoExec.sourceBytes or 0)
+    else
+        sourceText = "none - " .. sourceHint()
+    end
+    local parts = {
+        "auto: " .. (cfg.autoExecute == true and "ON" or "OFF"),
+        "saved " .. (AutoExec.savedOn == nil and "?" or (AutoExec.savedOn and "ON" or "OFF")),
+        "queue " .. tostring(AutoExec.queueName or "none"),
+        "src " .. sourceText,
+    }
+    if AutoExec.compileOk == true then
+        parts[#parts + 1] = "compiles OK"
+    elseif AutoExec.compileOk == false then
+        parts[#parts + 1] = "compile error"
+    end
+    if AutoExec.queueCount > 0 then
+        parts[#parts + 1] = string.format("queued x%d @ %s",
+            AutoExec.queueCount, tostring(AutoExec.lastAt or "?"))
+    end
+    if AutoExec.testText then parts[#parts + 1] = AutoExec.testText end
+    if AutoExec.reason then parts[#parts + 1] = AutoExec.reason end
+    return table.concat(parts, " | ")
+end
+
+-- Mark this server so a queued copy for the same server exits at its guard.
+do
+    local jobs = jobTable()
+    if jobs then jobs[jobKey()] = true end
+end
+
+S = {
+    running = false,
+    state = "idle",
+    kills = 0,
+    swings = 0,
+    hits = 0,
+    rate = 0,
+    target = nil,
+    dist = nil,
+    alive = 0,
+    gas = nil,
+    refills = nil,
+    refillsAttr = nil,
+    refillsText = nil,
+    durability = nil,
+    durabilityX = nil,
+    durabilityY = nil,
+    durabilitySource = nil,
+    reloading = false,
+    refilling = false,
+    bladesBroken = false,
+    napeParts = 0,
+    cluster = 0,
+    drift = 0,
+    lastDrift = 0,
+    pullRan = false,
+    pullMethod = "off",
+    pullMsg = nil,
+    pulls = 0,
+    jointsOff = 0,
+    jointsOn = 0,
+    pinActive = false,
+    pinMsg = nil,
+    pinDrift = 0,
+    meter = {
+        swings = 0, damage = 0, hits = 0, kills = 0, swingsSinceKill = 0,
+        lastDamage = 0, lastSpeed = 0, lastPull = "off", lastPullRan = false,
+        lastSwingBefore = 0, lastSwingAfter = 0, lastSwingAt = 0,
+        lastHealth = nil, watchHumanoid = nil, deadCounted = false,
+        recent = {}, current = nil,
+    },
+    autoMsg = nil,
+    err = nil,
+    results = false,
+    retries = 0,
+}
+
+if BOOT.lastError then S.err = BOOT.lastError end
+
+local clock = os.clock
+
+local function say(...)
+    local parts = {}
+    for index = 1, select("#", ...) do
+        parts[#parts + 1] = tostring(select(index, ...))
+    end
+    print("[AOTR] " .. table.concat(parts, " "))
+end
+
+local function normText(value)
+    return (string.lower(tostring(value or "")):gsub("[^%w]", ""))
+end
+
+local function myChar()
+    local char = localChar()
+    if not char then return nil, nil, nil end
+    return char, char:FindFirstChild("HumanoidRootPart"), char:FindFirstChildOfClass("Humanoid")
+end
+
+local function dead(model)
+    if model == nil or model.Parent == nil then return true end
+    local ok, flag = pcall(function() return model:GetAttribute("Dead") end)
+    if ok and flag == true then return true end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return true end
+    return humanoid.Health <= 0
+end
+
+local function napeOf(model)
+    -- Never let the local character's own hitboxes be read as a titan nape.
+    if not model or model == localChar() then return nil end
+    -- Raid bosses mark the open limb with a Marker BillboardGui whose Adornee is
+    -- the hittable Hit part. REFERENCE read this from memory (0x710); an internal
+    -- executor can read the property, so no offsets are involved.
+    local marker = model:FindFirstChild("Marker")
+    if marker then
+        local ok, adornee = pcall(function() return marker.Adornee end)
+        if ok and adornee and adornee:IsA("BasePart") and adornee.Parent
+            and adornee.Parent.Name == "Hit" then
+            return adornee
+        end
+    end
+    local hitboxes = model:FindFirstChild("Hitboxes")
+    local hit = hitboxes and hitboxes:FindFirstChild("Hit")
+    return hit and hit:FindFirstChild("Nape") or nil
+end
+
+local function hpOf(model)
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    return humanoid and humanoid.Health or -1
+end
+--============================================================================
+local function vimKey(keyCode, down)
+    if not caps.vim then return false end
+    return (pcall(function() caps.vim:SendKeyEvent(down, keyCode, false, game) end))
+end
+
+local VK = {
+    Space = 0x20, LeftShift = 0xA0, Return = 0x0D, Escape = 0x1B, Backspace = 0x08,
+    BackSlash = 0xDC, Tab = 0x09, LeftControl = 0xA2, RightControl = 0xA3,
+}
+
+local function vkOf(keyCode)
+    local name = keyCode and keyCode.Name
+    if not name then return nil end
+    if VK[name] then return VK[name] end
+    local digit = name:match("^F(%d+)$")
+    if digit then return 0x70 + tonumber(digit) - 1 end
+    if #name == 1 then
+        local byte = string.byte(name:upper())
+        if (byte >= 65 and byte <= 90) or (byte >= 48 and byte <= 57) then return byte end
+    end
+    return nil
+end
+
+local HeldKeys = {}
+
+local function keyDown(keyCode)
+    local vk = vkOf(keyCode)
+    if not vk then return false end
+    HeldKeys[vk] = keyCode
+    if caps.keypress then
+        local ok = pcall(caps.keypress, vk)
+        if ok then return true end
+    end
+    if vimKey(keyCode, true) then return true end
+    HeldKeys[vk] = nil
+    return false
+end
+
+local function keyUp(keyCode)
+    local vk = vkOf(keyCode)
+    if not vk then return false end
+    HeldKeys[vk] = nil
+    if caps.keyrelease then pcall(caps.keyrelease, vk) end
+    vimKey(keyCode, false)
+    return true
+end
+
+local function keyTap(keyCode, hold)
+    if not keyDown(keyCode) then return false end
+    task.wait(hold or 0.03)
+    keyUp(keyCode)
+    return true
+end
+
+local function vimClick()
+    if not caps.vim then return false end
+    local camera = currentCamera()
+    local viewport = camera and camera.ViewportSize
+    local x, y = 320, 320
+    if viewport and viewport.X > 0 then x, y = viewport.X / 2, viewport.Y / 2 end
+    local ok = pcall(function()
+        caps.vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        task.wait(0.03)
+        caps.vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    end)
+    return ok
+end
+
+local function releaseInput()
+    -- Release only what this script pressed. Never send a fresh W or Space
+    -- press here: the old version did, so every pause tapped Space and W.
+    for vk, keyCode in pairs(HeldKeys) do
+        if caps.keyrelease then pcall(caps.keyrelease, vk) end
+        vimKey(keyCode, false)
+    end
+    HeldKeys = {}
+end
+
+local function equippedTool()
+    local char = localChar()
+    if not char then return nil end
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Tool") then return child end
+    end
+    return nil
+end
+-- reports success even when the game never swings, so the farm stood still.
+local function click()
+    -- The game reads the swing from the mouse. Tool:Activate() only plays the
+    -- animation and returns success, so trying it first meant the click was
+    -- never sent at all. VirtualInputManager goes first, at the crosshair;
+    -- executor mouse functions are the fallback, Activate is the last resort.
+    if vimClick() then
+        S.clickPath = "vim"
+        return true
+    end
+    if caps.mouse1click then
+        local ok = pcall(caps.mouse1click)
+        if ok then
+            S.clickPath = "mouse1click"
+            return true
+        end
+    end
+    if caps.mouse1press then
+        local ok = pcall(caps.mouse1press)
+        if ok then
+            task.delay(0.04, function()
+                if caps.mouse1release then pcall(caps.mouse1release) end
+            end)
+            S.clickPath = "mouse1press"
+            return true
+        end
+    end
+    local tool = equippedTool()
+    if tool and pcall(function() tool:Activate() end) then
+        S.clickPath = "activate"
+        return true
+    end
+    return false
+end
+
+local Net = { get = nil, get2 = nil, post = nil }
+
+
+function Net.bind()
+    if Net.get and Net.post then return true end
+    local assets = Replicated:FindFirstChild("Assets")
+    local remotes = assets and assets:FindFirstChild("Remotes")
+    if remotes then
+        local get = remotes:FindFirstChild("GET")
+        if get and get:IsA("RemoteFunction") then Net.get = get end
+        local get2 = remotes:FindFirstChild("GET_2")
+        if get2 and get2:IsA("RemoteFunction") then Net.get2 = get2 end
+        local post = remotes:FindFirstChild("POST")
+        if post and post:IsA("RemoteEvent") then Net.post = post end
+    end
+    if Net.get == nil or Net.post == nil then
+        local ok, all = pcall(function() return Replicated:GetDescendants() end)
+        if ok then
+            for _, instance in ipairs(all) do
+                if instance:IsA("RemoteFunction") then
+                    if instance.Name == "GET" and Net.get == nil then Net.get = instance end
+                    if instance.Name == "GET_2" and Net.get2 == nil then Net.get2 = instance end
+                elseif instance:IsA("RemoteEvent") then
+                    if instance.Name == "POST" and Net.post == nil then Net.post = instance end
+                end
+            end
+        end
+    end
+    return Net.get ~= nil or Net.post ~= nil
+end
+
+local function packArgs(...)
+    return table.pack(...)
+end
+
+local Template = { data = nil, loaded = false, loadedAt = 0 }
+
+function Template.load()
+    if Template.loaded and Template.data then return Template.data end
+    if Template.loaded and clock() - (Template.loadedAt or 0) < 2 then return nil end
+    local function missing()
+        Template.loaded, Template.loadedAt = true, clock()
+        return nil
+    end
+    if not (caps.isfile and caps.readfile) then return missing() end
+    local okFile, exists = pcall(isfile, "aotr_swing_template.json")
+    if not okFile or not exists then return missing() end
+    local ok, source = pcall(readfile, "aotr_swing_template.json")
+    if not ok or type(source) ~= "string" then return missing() end
+    local okDecode, data = pcall(function() return HttpService:JSONDecode(source) end)
+    if not okDecode or type(data) ~= "table" or type(data.calls) ~= "table" then return missing() end
+    Template.data, Template.loadedAt = data, clock()
+    Template.loaded = true
+    return data
+end
+
+function Template.build(item, target, nape)
+    if type(item) ~= "table" then return nil end
+    if item.kind == "nil" then return nil end
+    if item.kind == "number" or item.kind == "string" or item.kind == "boolean" then return item.value end
+    if item.kind == "Instance" then
+        local flat = string.lower(tostring(item.path or item.name or ""))
+        if string.find(flat, "nape", 1, true) or string.find(flat, "hitboxes", 1, true) then
+            return nape
+        end
+        local model = target and target.model
+        local found = model and model:FindFirstChild(tostring(item.name), true)
+        if not found then
+            local char = localChar()
+            if char then found = char:FindFirstChild(tostring(item.name), true) end
+        end
+        if not found then found = workspace:FindFirstChild(tostring(item.name), true) end
+        return found or nape
+    end
+    if item.kind == "CFrame" then return nape and nape.CFrame or nil end
+    if item.kind == "Vector3" then
+        return nape and nape.Position or Vector3.new(item.x or 0, item.y or 0, item.z or 0)
+    end
+    if item.kind == "table" then
+        local out = {}
+        for index, child in ipairs(item.values or {}) do out[index] = Template.build(child, target, nape) end
+        return out
+    end
+    return nil
+end
+
+function Template.available()
+    return Template.load() ~= nil
+end
+
+function Template.replay(target, nape)
+    local data = Template.load()
+    if not data then return 0 end
+    local calls = {}
+    for _, entry in ipairs(data.calls or {}) do
+        local endpoint = entry.args and entry.args[1] and entry.args[1].value
+        if (entry.remote == "POST" or entry.remote == "GET" or entry.remote == "GET_2")
+            and (endpoint == "Attacks" or endpoint == "Hitboxes") then
+            calls[#calls + 1] = entry
+        end
+    end
+    local sent, previous = 0, nil
+    for _, entry in ipairs(calls) do
+        local gap = math.max(0, (entry.at or 0) - (previous and previous.at or 0))
+        previous = entry
+        local function send()
+            local args = {}
+            for index, item in ipairs(entry.args or {}) do args[index] = Template.build(item, target, nape) end
+            local remote = (entry.remote == "GET" and Net.get)
+                or (entry.remote == "GET_2" and Net.get2) or Net.post
+            if remote then
+                if entry.method == "InvokeServer" and remote:IsA("RemoteFunction") then
+                    pcall(remote.InvokeServer, remote, table.unpack(args))
+                else
+                    pcall(remote.FireServer, remote, table.unpack(args))
+                end
+            end
+        end
+        if sent == 0 or gap <= 0.001 then send() else task.delay(gap, send) end
+        sent = sent + 1
+    end
+    return sent
+end
+--============================================================================
+local function hudTop()
+    local playerGui = getPlayerGui()
+    local interface = playerGui and playerGui:FindFirstChild("Interface")
+    local hud = interface and interface:FindFirstChild("HUD")
+    local main = hud and hud:FindFirstChild("Main")
+    return main and main:FindFirstChild("Top")
+end
+
+-- Gas and Blades sit one numbered wrapper frame below Top on this build; two
+-- levels of search survive that index changing.
+local function hudNode(top, name, depth)
+    if not top then return nil end
+    local direct = top:FindFirstChild(name)
+    if direct then return direct end
+    if (depth or 0) >= 2 then return nil end
+    for _, child in ipairs(top:GetChildren()) do
+        local found = hudNode(child, name, (depth or 0) + 1)
+        if found then return found end
+    end
+    return nil
+end
+
+local function gasPercent()
+    local gas = hudNode(hudTop(), "Gas")
+    local percentage = gas and gas:FindFirstChild("Percentage")
+    if not percentage then return nil end
+    local ok, text = pcall(function() return percentage.Text end)
+    if not ok or type(text) ~= "string" then return nil end
+    return tonumber(string.match(text, "(%d+)"))
+end
+
+local function hudSetsText()
+    local blades = hudNode(hudTop(), "Blades")
+    local sets = blades and blades:FindFirstChild("Sets")
+    local ok, text = pcall(function() return sets and sets.Text end)
+    if ok and type(text) == "string" then return text end
+    return "-"
+end
+
+-- The camp gas tank. Unclimbable.Camps.Camp.GasTanks.Refill is the measured
+-- path; other maps name it differently, so the fallback scans once and caches.
+local refillObject = nil
+
+local function refillPart()
+    if refillObject and refillObject.Parent then return refillObject end
+    refillObject = nil
+    local unclimbable = workspace:FindFirstChild("Unclimbable")
+    if not unclimbable then return nil end
+    local camps = unclimbable:FindFirstChild("Camps")
+    local camp = camps and camps:FindFirstChild("Camp")
+    local tanks = camp and camp:FindFirstChild("GasTanks")
+    local part = tanks and tanks:FindFirstChild("Refill")
+    if part and part:IsA("BasePart") then
+        refillObject = part
+        return part
+    end
+    for _, descendant in ipairs(unclimbable:GetDescendants()) do
+        if descendant.Name == "Refill" and descendant:IsA("BasePart") then
+            refillObject = descendant
+            return descendant
+        end
+    end
+    return nil
+end
+-- Forward declaration: resultsSignature needs the place check defined below.
+local currentKind
+
+local function resultsInfo()
+    local playerGui = getPlayerGui()
+    local interface = playerGui and playerGui:FindFirstChild("Interface")
+    local rewards = interface and interface:FindFirstChild("Rewards")
+    local main = rewards and rewards:FindFirstChild("Main")
+    return main and main:FindFirstChild("Info")
+end
+
+local function shown(instance)
+    -- Results panels are never destroyed, only hidden, so a stale panel in the
+    -- lobby must not count as a result. Walk Visible and Enabled up the tree.
+    local node = instance
+    while node and node ~= game do
+        local okVisible, visible = pcall(function() return node.Visible end)
+        if okVisible and visible == false then return false end
+        local okEnabled, enabled = pcall(function() return node.Enabled end)
+        if okEnabled and enabled == false then return false end
+        node = node.Parent
+    end
+    return true
+end
+
+local function resultsSignature()
+    -- The lobby keeps the last round's labels, and a stale panel there was being
+    -- read as a live result: fastTick then stood still ("results screen") and
+    -- auto-retry pressed Retry, which is what sent the character back to town.
+    -- Only a real round place may produce a signature. Same guard as the delta build.
+    if currentKind() ~= "mission" then
+        S.results = false
+        return nil
+    end
+    local okType, missionType = pcall(function() return workspace:GetAttribute("Type") end)
+    if not okType or missionType == nil then return nil end
+    local flatType = normText(missionType)
+    if flatType == "" or flatType == "none" or flatType == "lobby" then return nil end
+    local info = resultsInfo()
+    if not info or not shown(info) then return nil end
+    local stateLabel = info:FindFirstChild("State")
+    if not stateLabel then return nil end
+    local ok, text = pcall(function() return stateLabel.Text end)
+    if not ok or type(text) ~= "string" then return nil end
+    local upper = string.upper(text)
+    if not string.find(upper, "COMPLETED", 1, true) and not string.find(upper, "FAILED", 1, true) then
+        return nil
+    end
+    local parts = { upper }
+    local main = info:FindFirstChild("Main")
+    local stats = main and main:FindFirstChild("Stats")
+    for _, name in ipairs({ "Time_Taken", "Damage", "Kills", "Crits" }) do
+        local row = stats and stats:FindFirstChild(name)
+        local amount = row and row:FindFirstChild("Amount")
+        local okAmount, value = pcall(function() return amount.Text end)
+        parts[#parts + 1] = tostring(okAmount and value or "?")
+    end
+    local okSeconds, seconds = pcall(function() return workspace:GetAttribute("Seconds") end)
+    parts[#parts + 1] = tostring(okSeconds and seconds or "?")
+    return table.concat(parts, "|")
+end
+--============================================================================
+local PLACE_TABLES = {
+    [4658598196] = {
+        Menu = 13379208636, Lobby = 14916516914,
+        Shiganshina = 13379349730, Trost = 14012874501, Forest = 14638336319,
+        Outskirts = 13904207646, Utgard = 15220308770, Docks = 17688739434,
+        Stohess = 15824912319, Trade = 14932214603,
+        Training = 112374853034490, Chapel = 126678335159530,
+    },
+    [5310627045] = {
+        Menu = 15393224326, Lobby = 15393230099,
+        Shiganshina = 17373821193, Trost = 15393230324, Forest = 17373828240,
+        Outskirts = 17373824844, Utgard = 18182863694, Docks = 110415968652032,
+        Stohess = 139092911630535, Trade = 108309021405580,
+        Training = 85939958627504, Chapel = 133979984250876,
+    },
+}
+
+local placeInfo = PLACE_TABLES[game.GameId]
+if not placeInfo then
+    for _, candidate in pairs(PLACE_TABLES) do
+        for _, id in pairs(candidate) do
+            if id == game.PlaceId then placeInfo = candidate break end
+        end
+        if placeInfo then break end
+    end
+end
+placeInfo = placeInfo or PLACE_TABLES[4658598196]
+
+local NON_ROUND = { Menu = true, Lobby = true, Trade = true, Training = true }
+
+local function placeKind(id)
+    id = tonumber(id) or game.PlaceId
+    if id == placeInfo.Menu then return "menu" end
+    if id == placeInfo.Lobby then return "lobby" end
+    if id == placeInfo.Trade then return "trade" end
+    if id == placeInfo.Training then return "training" end
+    for name, value in pairs(placeInfo) do
+        if value == id and not NON_ROUND[name] then return "mission" end
+    end
+    return "unknown"
+end
+
+currentKind = function()
+    local kind = placeKind()
+    if kind ~= "unknown" then return kind end
+    if workspace:FindFirstChild("Titans") then return "mission" end
+    local playerGui = getPlayerGui()
+    local interface = playerGui and playerGui:FindFirstChild("Interface")
+    if interface and interface:FindFirstChild("Title_Screen", true) then return "menu" end
+    if Replicated:FindFirstChild("Missions") then return "lobby" end
+    return "unknown"
+end
+
+local function inLobby()
+    return currentKind() == "lobby"
+end
+
+local function roundActive()
+    local kind = currentKind()
+    if kind == "lobby" or kind == "menu" or kind == "trade" or kind == "training" then
+        return false
+    end
+    local folder = workspace:FindFirstChild("Titans")
+    if folder then
+        for _, model in ipairs(folder:GetChildren()) do
+            if model:IsA("Model") and not dead(model) then return true end
+        end
+    end
+    if resultsSignature() then return true end
+    local ok, roundType = pcall(function() return workspace:GetAttribute("Type") end)
+    if not ok or roundType == nil then return false end
+    local flat = normText(roundType)
+    return flat ~= "" and flat ~= "none" and flat ~= "lobby"
+end
+
+local UI = { gui = nil, controls = {}, dragging = false }
+local refreshStatus = function() end
+local refreshControls = function() end
+--============================================================================
+local GuiAuto = {}
+
+local function guiRoots()
+    local roots, seen = {}, {}
+    local function add(instance)
+        if instance and not seen[instance] then
+            seen[instance] = true
+            roots[#roots + 1] = instance
+        end
+    end
+    add(getPlayerGui())
+    if caps.gethui then add(probe(gethui)) end
+    add(probe(function() return game:GetService("CoreGui") end))
+    return roots
+end
+
+local function isOurs(instance)
+    local gui = UI.gui
+    local node = instance
+    while node do
+        if gui and node == gui then return true end
+        node = node.Parent
+    end
+    return false
+end
+
+local function guiVisible(instance)
+    local node = instance
+    while node do
+        local okGui, isGui = pcall(function() return node:IsA("GuiObject") end)
+        if okGui and isGui then
+            local okVisible, visible = pcall(function() return node.Visible end)
+            if okVisible and visible == false then return false end
+            local okSize, size = pcall(function() return node.AbsoluteSize end)
+            if okSize and size and (size.X < 1 or size.Y < 1) then return false end
+        end
+        node = node.Parent
+    end
+    return true
+end
+
+local function textOf(instance)
+    local parts = { tostring(instance.Name or "") }
+    local okText, text = pcall(function() return instance.Text end)
+    if okText and type(text) == "string" then parts[#parts + 1] = text end
+    local okLabel, label = pcall(function() return instance:FindFirstChildWhichIsA("TextLabel", true) end)
+    if okLabel and label then
+        local ok, value = pcall(function() return label.Text end)
+        if ok and type(value) == "string" then parts[#parts + 1] = value end
+    end
+    return table.concat(parts, " ")
+end
+
+local function buttonMatches(instance, aliases)
+    local haystack = normText(textOf(instance))
+    for _, alias in ipairs(aliases or {}) do
+        local needle = normText(alias)
+        if needle ~= "" and string.find(haystack, needle, 1, true) then return true, alias end
+    end
+    return false, nil
+end
+
+function GuiAuto.findAll(aliases, scope, exclude, into)
+    local roots = scope and { scope } or guiRoots()
+    local excludeFlat = {}
+    for _, entry in ipairs(exclude or {}) do excludeFlat[#excludeFlat + 1] = normText(entry) end
+    local found = into or {}
+    for _, root in ipairs(roots) do
+        for _, instance in ipairs(root:GetDescendants()) do
+            local okButton, isButton = pcall(function() return instance:IsA("GuiButton") end)
+            if okButton and isButton and not isOurs(instance) and guiVisible(instance) then
+                local matched = buttonMatches(instance, aliases)
+                if matched then
+                    local flat = normText(textOf(instance))
+                    local skip = false
+                    for _, entry in ipairs(excludeFlat) do
+                        if string.find(flat, entry, 1, true) then skip = true break end
+                    end
+                    if not skip then found[#found + 1] = instance end
+                end
+            end
+        end
+    end
+    return found
+end
+
+function GuiAuto.findButton(aliases, scope, exclude)
+    return GuiAuto.findAll(aliases, scope, exclude)[1]
+end
+function GuiAuto.centre(button)
+    local ok, position, size = pcall(function()
+        return button.AbsolutePosition, button.AbsoluteSize
+    end)
+    if not ok or not position or not size then return nil end
+    return Vector2.new(position.X + size.X / 2, position.Y + size.Y / 2)
+end
+
+-- What a real mouse would hit at this point. A backdrop or label stacked above
+-- the Retry button swallows input clicks, so the click has to go to whatever is
+-- on top instead of the button that was found by name.
+function GuiAuto.topAt(x, y)
+    local playerGui = getPlayerGui()
+    if not playerGui then return nil, "-" end
+    local ok, list = pcall(function() return playerGui:GetGuiObjectsAtPosition(x, y) end)
+    if not ok or type(list) ~= "table" then return nil, "-" end
+    local names, button = {}, nil
+    for _, object in ipairs(list) do
+        if #names < 3 then names[#names + 1] = tostring(object.Name) end
+        if not button then
+            local okButton, isButton = pcall(function() return object:IsA("GuiButton") end)
+            if okButton and isButton and not isOurs(object) then button = object end
+        end
+    end
+    return button, table.concat(names, ">")
+end
+
+function GuiAuto.matches(instance, aliases)
+    return (buttonMatches(instance, aliases))
+end
+
+-- True when the hit test at the button centre actually reaches the button (or a
+-- child of it). A hidden duplicate passes every Visible check and still no
+-- click ever lands on it.
+function GuiAuto.hits(button)
+    local point = GuiAuto.centre(button)
+    local playerGui = getPlayerGui()
+    if not point or not playerGui then return false, "" end
+    local ok, list = pcall(function() return playerGui:GetGuiObjectsAtPosition(point.X, point.Y) end)
+    if not ok or type(list) ~= "table" then return false, "" end
+    local names = {}
+    for index = 1, math.min(#list, 6) do
+        names[#names + 1] = tostring(list[index].Name)
+    end
+    for _, object in ipairs(list) do
+        local node = object
+        for _ = 1, 12 do
+            if node == button then return true, table.concat(names, ">") end
+            node = node.Parent
+            if not node then break end
+        end
+    end
+    return false, table.concat(names, ">")
+end
+
+--============================================================================
+local function clusterAt(model)
+    local probe = napeOf(model)
+    if not probe then return 0 end
+    local okPos, centre = pcall(function() return probe.Position end)
+    if not okPos or not centre then return 0 end
+    local folder = workspace:FindFirstChild("Titans")
+    if not folder then return 0 end
+    local count = 0
+    for _, other in ipairs(folder:GetChildren()) do
+        if other:IsA("Model") and other ~= model and not dead(other) then
+            local nape = napeOf(other)
+            if nape then
+                local ok, position = pcall(function() return nape.Position end)
+                if ok and position and (position - centre).Magnitude <= cfg.multiRadius then
+                    count = count + 1
+                end
+            end
+        end
+    end
+    return count
+end
+
+local function clusterCentre(model)
+    local probe = napeOf(model)
+    if not probe then return nil end
+    local okPos, centre = pcall(function() return probe.Position end)
+    if not okPos or not centre then return nil end
+    local folder = workspace:FindFirstChild("Titans")
+    if not folder then return centre end
+    local sum, count = Vector3.new(0, 0, 0), 0
+    for _, other in ipairs(folder:GetChildren()) do
+        if other:IsA("Model") and other ~= model and not dead(other) then
+            local nape = napeOf(other)
+            if nape then
+                local ok, position = pcall(function() return nape.Position end)
+                if ok and position and (position - centre).Magnitude <= cfg.multiRadius then
+                    sum = sum + position
+                    count = count + 1
+                end
+            end
+        end
+    end
+    if count == 0 then return centre end
+    return Vector3.new(sum.X / (count + 1), sum.Y / (count + 1), sum.Z / (count + 1))
+end
+
+local function attackTitan()
+    local folder = workspace:FindFirstChild("Titans")
+    local titan = folder and folder:FindFirstChild("Attack_Titan")
+    if titan and titan.Parent and not dead(titan) then return titan end
+    return nil
+end
+
+local function roaring(titan)
+    if not titan then return false end
+    local ok, value = pcall(function() return titan:GetAttribute("Attack") end)
+    return ok and value == "Roar"
+end
+
+-- nearest | attack (Attack Titan first) | hp (lowest health first), with a
+-- a crowd bonus when group hits are on.
+local function chooseTarget()
+    local folder = workspace:FindFirstChild("Titans")
+    local _, root = myChar()
+    if not folder or not root then return nil end
+    local origin = root.Position
+    local boss = attackTitan()
+
+    if boss and not roaring(boss) and cfg.priority ~= "hp" then
+        local nape = napeOf(boss)
+        local hrp = boss:FindFirstChild("HumanoidRootPart")
+        if nape and hrp then
+            return { model = boss, nape = nape, name = boss.Name, dist = (hrp.Position - origin).Magnitude }
+        end
+    end
+
+    local best, bestScore = nil, nil
+    for _, model in ipairs(folder:GetChildren()) do
+        if model:IsA("Model") and model ~= localChar() and not dead(model) and not (model == boss and roaring(model)) then
+            local nape = napeOf(model)
+            local hrp = model:FindFirstChild("HumanoidRootPart")
+            if nape and hrp then
+                local distance = (hrp.Position - origin).Magnitude
+                local score = distance
+                if cfg.priority == "hp" then score = hpOf(model) * 10000 + distance end
+                if cfg.multiHit then
+                    local crowd = clusterAt(model)
+                    if crowd >= cfg.multiMin then score = score - crowd * 1000 end
+                end
+                if bestScore == nil or score < bestScore then
+                    bestScore = score
+                    best = { model = model, nape = nape, name = model.Name, dist = distance }
+                end
+            end
+        end
+    end
+    return best
+end
+--============================================================================
+local HitSignal = {}
+
+local function attrSnapshot(inst, prefix, out)
+    if not inst then return end
+    local ok, attributes = pcall(function() return inst:GetAttributes() end)
+    if ok and type(attributes) == "table" then
+        for key, value in pairs(attributes) do
+            if type(value) == "number" then out[prefix .. key] = value end
+        end
+    end
+end
+
+local function valueSnapshot(inst, prefix, out, deep)
+    if not inst then return end
+    local okChildren, children = pcall(function()
+        return deep and inst:GetDescendants() or inst:GetChildren()
+    end)
+    if not okChildren or type(children) ~= "table" then return end
+    for _, child in ipairs(children) do
+        if child:IsA("ValueBase") then
+            local ok, value = pcall(function() return child.Value end)
+            if ok and type(value) == "number" then out[prefix .. child.Name] = value end
+        end
+    end
+end
+
+function HitSignal.fast(model)
+    local out = {}
+    if not model then return out end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid then out.health = humanoid.Health end
+    attrSnapshot(model, "attr:", out)
+    local nape = napeOf(model)
+    if nape then
+        attrSnapshot(nape, "nattr:", out)
+        attrSnapshot(nape.Parent, "hattr:", out)
+        valueSnapshot(nape, "value:", out, false)
+        valueSnapshot(nape.Parent, "value:", out, false)
+    end
+    local flat = string.lower(tostring(cfg.hitSignal or "auto"))
+    if flat ~= "auto" and out[cfg.hitSignal] == nil then
+        local value = HitSignal.readKey(model, cfg.hitSignal)
+        if value ~= nil then out[cfg.hitSignal] = value end
+    end
+    return out
+end
+
+function HitSignal.readKey(model, key)
+    if not model or type(key) ~= "string" then return nil end
+    if key == "health" then
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        return humanoid and humanoid.Health or nil
+    end
+    if key == "maxhealth" then
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        return humanoid and humanoid.MaxHealth or nil
+    end
+    if key == "player:Stat" then return tonumber(lp:GetAttribute("Stat")) end
+    local kind, name = string.match(key, "^(%a+):(.+)$")
+    if not kind then return nil end
+    local nape = napeOf(model)
+    if kind == "attr" then
+        local ok, value = pcall(function() return model:GetAttribute(name) end)
+        return ok and tonumber(value) or nil
+    end
+    if kind == "nattr" then
+        local ok, value = pcall(function() return nape and nape:GetAttribute(name) end)
+        return ok and tonumber(value) or nil
+    end
+    if kind == "hattr" then
+        local ok, value = pcall(function() return nape and nape.Parent and nape.Parent:GetAttribute(name) end)
+        return ok and tonumber(value) or nil
+    end
+    if kind == "dattr" then
+        local partName, attrName = string.match(name, "^([^:]+):(.+)$")
+        if not partName then return nil end
+        local okFind, part = pcall(function() return model:FindFirstChild(partName, true) end)
+        if not okFind or not part then return nil end
+        local ok, value = pcall(function() return part:GetAttribute(attrName) end)
+        return ok and tonumber(value) or nil
+    end
+    if kind == "value" then
+        for _, holder in ipairs({ nape, nape and nape.Parent, model }) do
+            if holder then
+                local okFind, inst = pcall(function() return holder:FindFirstChild(name, true) end)
+                if okFind and inst and inst:IsA("ValueBase") then
+                    local ok, value = pcall(function() return inst.Value end)
+                    if ok and type(value) == "number" then return value end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function HitSignal.diff(before, after)
+    local changes = {}
+    for key, old in pairs(before or {}) do
+        local new = after and after[key]
+        if new ~= nil and new ~= old then
+            changes[#changes + 1] = { key = key, before = old, after = new, delta = new - old }
+        end
+    end
+    table.sort(changes, function(a, b) return math.abs(a.delta) > math.abs(b.delta) end)
+    return changes
+end
+
+function HitSignal.check(watch)
+    if not watch or watch.done or not watch.model then return false end
+    if clock() - (watch.at or 0) > 0.7 then
+        watch.done = true
+        return watch.hit == true
+    end
+    local after = HitSignal.fast(watch.model)
+    local changes = HitSignal.diff(watch.before, after)
+    if #changes == 0 then return false end
+    -- Health regen and 0.01 attribute jitter are not hits. Health only counts
+    -- when it drops; other numeric signals must move by at least 0.5.
+    local usable = {}
+    for _, change in ipairs(changes) do
+        if change.key ~= "player:Stat" and change.key ~= "maxhealth" then
+            if change.key == "health" then
+                if change.delta <= -0.5 then usable[#usable + 1] = change end
+            elseif math.abs(change.delta) >= 0.5 then
+                usable[#usable + 1] = change
+            end
+        end
+    end
+    if #usable == 0 then return false end
+    local chosen = nil
+    if cfg.hitSignal and cfg.hitSignal ~= "auto" and after[cfg.hitSignal] ~= nil then
+        for _, change in ipairs(usable) do
+            if change.key == cfg.hitSignal then chosen = change break end
+        end
+    end
+    chosen = chosen or usable[1]
+    local damage = math.abs(chosen.delta)
+    if chosen.key == "health" then damage = math.max(0, -chosen.delta) end
+    watch.hit = true
+    watch.damage = (watch.damage or 0) + damage
+    watch.signal = chosen.key
+    watch.before = after
+    watch.done = true
+    return true
+end
+-- Heartbeat, and the nape is only released on death / switch / pause / stop.
+local Pin = {
+    active = false, part = nil, model = nil, joints = {}, size = nil, canCollide = nil,
+    offset = nil, at = 0, base = nil, drift = 0, msg = nil, conn = nil,
+}
+
+local function pinJoints(model, part)
+    local list = {}
+    local ok, joints = pcall(function() return part:GetJoints() end)
+    if ok and type(joints) == "table" then
+        for _, joint in ipairs(joints) do list[#list + 1] = joint end
+    end
+    if #list == 0 and model then
+        for _, descendant in ipairs(model:GetDescendants()) do
+            if descendant:IsA("JointInstance") or descendant:IsA("WeldConstraint") then
+                local okParts, part0, part1 = pcall(function() return descendant.Part0, descendant.Part1 end)
+                if okParts and (part0 == part or part1 == part) then list[#list + 1] = descendant end
+            end
+        end
+    end
+    return list
+end
+
+function Pin.stop(reason)
+    if not Pin.active then return false end
+    for _, item in ipairs(Pin.joints) do
+        if item.parent and item.joint.Parent == nil then
+            pcall(function() item.joint.Parent = item.parent end)
+        end
+        pcall(function() item.joint.Enabled = item.enabled end)
+        if item.enabled then S.jointsOn = (S.jointsOn or 0) + 1 end
+    end
+    if Pin.part and Pin.part.Parent then
+        if Pin.size then pcall(function() Pin.part.Size = Pin.size end) end
+        if Pin.canCollide ~= nil then pcall(function() Pin.part.CanCollide = Pin.canCollide end) end
+    end
+    S.jointsOff = math.max(0, (S.jointsOff or 0) - #Pin.joints)
+    Pin.active, Pin.part, Pin.model, Pin.joints = false, nil, nil, {}
+    Pin.size, Pin.canCollide, Pin.offset, Pin.base, Pin.drift = nil, nil, nil, nil, 0
+    S.pinActive, S.pullRan, S.pullMethod = false, false, "off"
+    if reason then S.pinMsg = reason end
+    return true
+end
+
+function Pin.ensure(target)
+    if not cfg.pinNape or not cfg.napeEnabled then
+        if Pin.active then Pin.stop("pin off") end
+        return false
+    end
+    if not target or not target.model then Pin.stop("pin: no target") return false end
+    local nape = target.nape
+    if not nape or not nape.Parent then
+        nape = napeOf(target.model)
+        target.nape = nape
+    end
+    if not nape or not nape.Parent then Pin.stop("pin: nape missing") return false end
+    if Pin.active and Pin.model == target.model and Pin.part == nape and Pin.part.Parent then
+        return true
+    end
+    Pin.stop(nil)
+    Pin.part, Pin.model, Pin.size = nape, target.model, nape.Size
+    local okCollide, canCollide = pcall(function() return nape.CanCollide end)
+    Pin.canCollide = okCollide and canCollide or nil
+    Pin.offset = CFrame.new(0, cfg.magnetY or 2, 0)
+    local disabled = 0
+    for _, joint in ipairs(pinJoints(target.model, nape)) do
+        local okParts, part0, part1 = pcall(function() return joint.Part0, joint.Part1 end)
+        local other = okParts and ((part0 == nape) and part1 or part0) or nil
+        if other and other ~= nape then
+            local enabled = true
+            pcall(function() enabled = joint.Enabled end)
+            local parent = joint.Parent
+            local detached = pcall(function() joint.Enabled = false end)
+            if cfg.pullDetach == "unparent" and (joint:IsA("Weld") or joint:IsA("WeldConstraint")) then
+                local okParent = pcall(function() joint.Parent = nil end)
+                if okParent then detached = true end
+            end
+            if detached then disabled = disabled + 1 end
+            Pin.joints[#Pin.joints + 1] = { joint = joint, enabled = enabled, parent = parent }
+        end
+    end
+    if disabled == 0 then
+        Pin.stop("pin: no joint on the nape")
+        S.pullMethod, S.pullRan = "touched", false
+        S.pullMsg = "pin found no joint; per-swing Touched fallback will run"
+        return false
+    end
+    pcall(function() nape.CanTouch = true end)
+    local cube = cfg.magnetSize or 15
+    if Pin.size ~= Vector3.new(cube, cube, cube) then
+        pcall(function() nape.Size = Vector3.new(cube, cube, cube) end)
+    end
+    local hrp = target.model:FindFirstChild("HumanoidRootPart")
+    Pin.base = hrp and hrp.Position or nil
+    Pin.active, Pin.at, Pin.drift = true, clock(), 0
+    Pin.msg = string.format("pinned (%d joints off)", disabled)
+    S.pinActive, S.pullRan, S.pullMethod, S.pullMsg = true, true, "pin", Pin.msg
+    S.jointsOff = (S.jointsOff or 0) + disabled
+    return true
+end
+
+function Pin.step()
+    if not Pin.active then return end
+    if not S.running or S.results or S.refilling then
+        Pin.stop("pin paused")
+        return
+    end
+    if not Pin.model or dead(Pin.model) or not Pin.part or not Pin.part.Parent then
+        Pin.stop("pin released: target gone")
+        return
+    end
+    local current = napeOf(Pin.model)
+    if current and current ~= Pin.part then
+        Pin.stop("pin: nape changed")
+        return
+    end
+    local _, root = myChar()
+    if not root then return end
+    local hrp = Pin.model:FindFirstChild("HumanoidRootPart")
+    local before = hrp and hrp.Position
+    pcall(function() Pin.part.CFrame = root.CFrame * Pin.offset end)
+    local after = hrp and hrp.Position
+    if before and after then
+        Pin.drift = (after - before).Magnitude
+        S.lastDrift, S.drift = Pin.drift, math.max(S.drift or 0, Pin.drift)
+        S.pinDrift = Pin.drift
+        if Pin.drift > (cfg.pinDrift or 3) then
+            local moved = Pin.drift
+            cfg.pullDetach = "unparent"
+            saveCfg()
+            Pin.stop(string.format("drift %.1f studs - pullDetach=unparent", moved))
+            S.autoMsg = string.format("pin drift %.1f studs: unparent fallback", moved)
+        end
+    end
+    if Pin.active then S.pullRan, S.pullMethod = true, "pin" end
+end
+
+if RunService then
+    Pin.conn = RunService.Heartbeat:Connect(safe(function() pcall(Pin.step) end, "connect"))
+end
+-- locked; every 50 swings the ladder is re-tested.
+local Path = {
+    order = { "gui", "remote", "mouse" }, index = 1, locked = nil, testAt = 0,
+    counters = {}, msg = nil,
+}
+
+function Path.reset()
+    Path.index, Path.locked, Path.testAt, Path.msg = 1, nil, 0, nil
+    Path.counters = {
+        gui = { swings = 0, hits = 0 },
+        remote = { swings = 0, hits = 0 },
+        mouse = { swings = 0, hits = 0 },
+    }
+end
+
+function Path.current()
+    local mode = cfg.attackPath or "auto"
+    if mode ~= "auto" then return mode end
+    if Path.locked then return Path.locked end
+    return Path.order[Path.index] or "gui"
+end
+
+function Path.advance()
+    Path.index = (Path.index % #Path.order) + 1
+end
+
+function Path.note(name, confirmed)
+    local counter = Path.counters[name]
+    if not counter then counter = { swings = 0, hits = 0 }; Path.counters[name] = counter end
+    if confirmed then
+        counter.hits = counter.hits + 1
+        if cfg.attackPath == "auto" then
+            Path.locked = name
+            Path.testAt = (S.swings or 0) + 50
+            Path.msg = "locked " .. tostring(name)
+        end
+    end
+    counter.swings = counter.swings + 1
+end
+
+function Path.retest()
+    if cfg.attackPath ~= "auto" or not Path.locked then return end
+    if (S.swings or 0) >= (Path.testAt or 0) then
+        Path.locked, Path.index, Path.msg = nil, 1, "re-testing"
+    end
+end
+
+function Path.summary()
+    local parts = {}
+    for _, name in ipairs(Path.order) do
+        local counter = Path.counters[name] or { swings = 0, hits = 0 }
+        parts[#parts + 1] = string.format("%s %d/%d", name, counter.hits or 0, counter.swings or 0)
+    end
+    return table.concat(parts, "  ")
+end
+
+-- A no-hit swing only means something when the swing could actually land.
+-- Failed HUD reads (gas nil), a dead player, broken blades, an out-of-reach
+-- target or a refill must never drive the watchdog.
+function Path.nohitEligible()
+    if not S.running or S.refilling or S.results then return false end
+    local target = S.target
+    if not target or not target.model or dead(target.model) then return false end
+    local humanoid = target.model:FindFirstChildOfClass("Humanoid")
+    if not humanoid or (tonumber(humanoid.Health) or 0) <= 0 then return false end
+    local _, root, ownHumanoid = myChar()
+    if not root or not ownHumanoid or (tonumber(ownHumanoid.Health) or 0) <= 0 then return false end
+    if S.bladesBroken then return false end
+    local gas = tonumber(S.gas)
+    if not gas or gas <= 0 then return false end
+    local hrp = target.model:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    local okDist, distance = pcall(function() return (hrp.Position - root.Position).Magnitude end)
+    if not okDist or not distance then return false end
+    return distance <= (S.hoverNow or cfg.hover or 120) + 45
+end
+
+Path.reset()
+--============================================================================
+local napeStock = {}
+
+local function remember(part)
+    local entry = napeStock[part]
+    if not entry then
+        entry = { size = part.Size }
+        napeStock[part] = entry
+    end
+    return entry
+end
+
+local function applyNapes()
+    if not cfg.napeEnabled then
+        S.napeParts = 0
+        S.pullMethod = "off"
+        S.pullMsg = "disabled by the Pin nape toggle"
+        S.pullRan = false
+        return 0
+    end
+    if cfg.pullDetach == "unparent" and S.pullBlockedUntil and clock() < S.pullBlockedUntil then
+        S.napeParts = 0
+        S.pullMethod = "wait"
+        S.pullMsg = string.format("drift lockout: %.1fs left", math.max(0, S.pullBlockedUntil - clock()))
+        S.pullRan = false
+        return 0
+    end
+    local target = S.target
+    if not target then
+        S.napeParts = 0
+        S.pullMethod = "off"
+        S.pullMsg = "no target"
+        S.pullRan = false
+        return 0
+    end
+    local _, root = myChar()
+    if not root then
+        S.napeParts = 0
+        S.pullMethod = "off"
+        S.pullMsg = "no character root"
+        S.pullRan = false
+        return 0
+    end
+    local folder = workspace:FindFirstChild("Titans")
+    if not folder then
+        S.napeParts = 0
+        S.pullMethod = "off"
+        S.pullMsg = "workspace.Titans missing"
+        S.pullRan = false
+        return 0
+    end
+    S.pullRan = false
+    local playerPos = root.Position
+    -- REFERENCE: Nape.CFrame = playerHRP.CFrame * CFrame.new(0, NapeOffsetY, 0)
+    local dest = root.CFrame * CFrame.new(0, cfg.magnetY or 2, 0)
+    local cube = cfg.magnetSize or 15
+    local want = Vector3.new(cube, cube, cube)
+    local placed = 0
+
+    local function pull(model, isTarget)
+        if not model or model == localChar() or model.Parent ~= folder then
+            if isTarget then S.pullMethod, S.pullMsg = "off", "target model is gone" end
+            return false
+        end
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if not humanoid or humanoid.Health <= 0 then
+            if isTarget then S.pullMethod, S.pullMsg = "off", "target has no live Humanoid" end
+            return false
+        end
+        local nape = napeOf(model)
+        if not nape or not nape.Parent or nape.Parent.Name ~= "Hit" then
+            if isTarget then S.pullMethod, S.pullMsg = "off", "nape missing (Hit.Nape)" end
+            return false
+        end
+        local hrp = model:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local ok, far = pcall(function() return (hrp.Position - playerPos).Magnitude > 600 end)
+            if ok and far then
+                if isTarget then S.pullMethod, S.pullMsg = "off", "target beyond 600 studs" end
+                return false
+            end
+        end
+
+        -- Internal BasePart.CFrame writes move the whole welded assembly, so the
+        -- nape has to be detached first or the titan follows it. REFERENCE's
+        -- raw memory write moved only the part; this is the internal equivalent.
+        local function reattach(entry, restoreSize)
+            local record = entry and entry.detached
+            if not record then return end
+            entry.detached = nil
+            local part = record.nape
+            local anchored = false
+            for _, item in ipairs(record.joints) do
+                local joint, other, offset, enabled = item[1], item[2], item[3], item[4]
+                local parent, unparented = item[5], item[6]
+                if joint then
+                    if not anchored and part and part.Parent and other and other.Parent then
+                        pcall(function() part.CFrame = other.CFrame * offset end)
+                        anchored = true
+                    end
+                    if unparented and parent then
+                        pcall(function() joint.Parent = parent end)
+                    end
+                    pcall(function() joint.Enabled = enabled end)
+                    if enabled then S.jointsOn = (S.jointsOn or 0) + 1 end
+                end
+            end
+            if restoreSize and part and part.Parent and record.size then
+                pcall(function() part.Size = record.size end)
+            end
+            if part and part.Parent and record.canCollide ~= nil then
+                pcall(function() part.CanCollide = record.canCollide end)
+            end
+            S.jointsOff = math.max(0, (S.jointsOff or 0) - (record.disabled or #record.joints))
+        end
+
+        local function jointsOf(targetModel, part)
+            local list = {}
+            local ok, joints = pcall(function() return part:GetJoints() end)
+            if ok and type(joints) == "table" then
+                for _, joint in ipairs(joints) do list[#list + 1] = joint end
+            end
+            if #list == 0 and targetModel then
+                for _, descendant in ipairs(targetModel:GetDescendants()) do
+                    if descendant:IsA("JointInstance") or descendant:IsA("WeldConstraint") then
+                        local okParts, part0, part1 = pcall(function() return descendant.Part0, descendant.Part1 end)
+                        if okParts and (part0 == part or part1 == part) then list[#list + 1] = descendant end
+                    end
+                end
+            end
+            return list
+        end
+
+        -- No joint means the nape cannot be moved without risking the titan:
+        -- never write its CFrame. Fire the blade's Touched instead.
+        local function touchedSwing(part)
+            local char = localChar()
+            if not char then return false end
+            local fired = 0
+            for _, blade in ipairs(char:GetDescendants()) do
+                if blade:IsA("BasePart") and caps.getconnections then
+                    local ok, connections = pcall(getconnections, blade.Touched)
+                    if ok and type(connections) == "table" then
+                        for _, connection in ipairs(connections) do
+                            if pcall(function() connection:Fire(part) end) then fired = fired + 1 end
+                        end
+                    end
+                end
+            end
+            if fired == 0 and type(firetouchinterest) == "function" then
+                for _, blade in ipairs(char:GetDescendants()) do
+                    if blade:IsA("BasePart") then
+                        pcall(firetouchinterest, blade, part, 0)
+                        pcall(firetouchinterest, blade, part, 1)
+                        fired = fired + 1
+                    end
+                end
+            end
+            S.pullMsg = fired > 0
+                and ("no joint - fired " .. fired .. " Touched connection(s)")
+                or "no joint and no Touched handler"
+            S.pullRan = fired > 0
+            S.state = S.pullMsg
+            return fired > 0
+        end
+
+        local entry = remember(nape)
+        if entry.detached then reattach(entry, false) end
+
+        local mode = (cfg.pullDetach == "unparent") and "unparent" or "disable"
+        local record = { nape = nape, model = model, joints = {}, size = entry.size, at = clock(), mode = mode }
+        for _, joint in ipairs(jointsOf(model, nape)) do
+            local okParts, part0, part1 = pcall(function() return joint.Part0, joint.Part1 end)
+            if okParts then
+                local other = (part0 == nape) and part1 or part0
+                if other and other ~= nape then
+                    local enabled = true
+                    pcall(function() enabled = joint.Enabled end)
+                    local okOffset, offset = pcall(function() return other.CFrame:ToObjectSpace(nape.CFrame) end)
+                    if okOffset and offset then
+                        record.joints[#record.joints + 1] = {
+                            joint, other, offset, enabled, joint.Parent, false,
+                        }
+                    end
+                end
+            end
+        end
+
+        if #record.joints == 0 then
+            S.pullMethod = "touched"
+            return touchedSwing(nape)
+        end
+
+        -- Default (pullDetach="disable") is the pre-patch path: Enabled=false,
+        -- write the CFrame in this same frame, no collision change, no wait.
+        -- pullDetach="unparent" is the experimental anti-drag path.
+        local disabled = 0
+        for _, item in ipairs(record.joints) do
+            local joint = item[1]
+            local detached = pcall(function() joint.Enabled = false end)
+            if mode == "unparent" and (joint:IsA("Weld") or joint:IsA("WeldConstraint")) then
+                local okParent = pcall(function() joint.Parent = nil end)
+                item[6] = okParent
+                if okParent then detached = true end
+            end
+            if detached then disabled = disabled + 1 end
+        end
+        record.disabled = disabled
+        S.jointsOff = (S.jointsOff or 0) + disabled
+        entry.detached, entry.reattach = record, reattach
+
+        if mode == "unparent" and disabled < #record.joints then
+            for _, item in ipairs(record.joints) do
+                local joint = item[1]
+                if item[5] then pcall(function() joint.Parent = item[5] end) end
+                pcall(function() joint.Enabled = item[4] end)
+            end
+            S.jointsOff = math.max(0, (S.jointsOff or 0) - disabled)
+            entry.detached = nil
+            S.pullMethod = "blocked"
+            S.pullMsg = string.format("unparent blocked: %d/%d joints detached", disabled, #record.joints)
+            S.pullRan = false
+            S.state = S.pullMsg
+            return false
+        end
+
+        if (tonumber(cfg.pullWait) or 0) >= 1 then
+            S.pullMethod = "wait"
+            S.pullMsg = "waiting one physics frame after detach"
+            S.pullRan = false
+            task.wait()
+            if entry.detached ~= record or not S.running or dead(model)
+                or not nape.Parent or not root.Parent then
+                pcall(reattach, entry, true)
+                S.pullMethod = "blocked"
+                S.pullMsg = "aborted while waiting for detach"
+                S.pullRan = false
+                return false
+            end
+            record.at = clock()
+        end
+
+        if cfg.pullNoCollide then
+            local canCollide = true
+            pcall(function() canCollide = nape.CanCollide end)
+            record.canCollide = canCollide
+            pcall(function() nape.CanCollide = false end)
+        end
+
+        dest = root.CFrame * CFrame.new(0, cfg.magnetY or 2, 0)
+        local before = hrp and hrp.Position
+        local okMove = pcall(function() nape.CFrame = dest end)
+        local after = hrp and hrp.Position
+        if not okMove then
+            reattach(entry, true)
+            S.pullMethod = "blocked"
+            S.pullMsg = "nape CFrame write failed"
+            S.pullRan = false
+            return false
+        end
+
+        local drift = 0
+        if before and after then
+            drift = (after - before).Magnitude
+            S.drift = math.max(S.drift or 0, drift)
+            S.lastDrift = drift
+        end
+        if drift > 3 then
+            S.pullMethod = "drift"
+            S.pullMsg = string.format("titan moved %.1f studs during pull", drift)
+            if mode == "unparent" then
+                reattach(entry, true)
+                if isTarget then
+                    S.pullStrikes = (S.pullStrikes or 0) + 1
+                    if S.pullStrikes >= 3 then
+                        cfg.napeEnabled = false
+                        pcall(refreshControls)
+                        S.pullMethod = "off"
+                        S.pullMsg = string.format("PIN OFF - titan moved %.1f studs", drift)
+                    else
+                        S.pullBlockedUntil = clock() + 5
+                    end
+                end
+                S.pullRan = false
+                S.state = S.pullMsg
+                return false
+            end
+            -- Default path keeps the nape on the player for this swing even if
+            -- the pre-patch detach dragged the titan. The timer reattaches it.
+        elseif isTarget then
+            S.pullStrikes = 0
+        end
+
+        -- Size once per instance: the game keeps it and Size writes are heavy.
+        if entry.pullSize ~= cube then
+            pcall(function() nape.Size = want end)
+            entry.pullSize = cube
+        end
+        S.pullMethod = (drift > 3) and "drift" or "ran"
+        S.pullRan = true
+        if drift <= 3 then S.pullMsg = nil end
+        S.pulls = (S.pulls or 0) + 1
+        placed = placed + 1
+
+        -- Re-attach after the slash. WeldConstraint re-welds at the CURRENT
+        -- offset when enabled, so the nape goes back to its saved offset while
+        -- still detached; only then are the joints enabled again.
+        task.delay(0.22, function()
+            if entry.detached == record then pcall(reattach, entry, false) end
+        end)
+        return true
+    end
+
+    pull(target.model, true)
+
+    -- Pin All Napes: the nearest napeMult-1 live titans, every other slash,
+    -- one frame apart. One blade swing caps at about 6 titans in this game.
+    local extras = cfg.magnet and math.max(0, math.min(5, (cfg.napeMult or 6) - 1)) or 0
+    if extras > 0 then
+        S.pullSlash = (S.pullSlash or 0) + 1
+        if S.pullSlash % 2 == 0 then
+            local targetHrp = target.model:FindFirstChild("HumanoidRootPart")
+            local anchor = targetHrp and targetHrp.Position or playerPos
+            local candidates = {}
+            for _, model in ipairs(folder:GetChildren()) do
+                if model ~= target.model and model:IsA("Model") and not dead(model) then
+                    local hrp = model:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local ok, distance = pcall(function() return (hrp.Position - anchor).Magnitude end)
+                        if ok and distance and distance <= (cfg.napeRange or 900) then
+                            candidates[#candidates + 1] = { model = model, d = distance }
+                        end
+                    end
+                end
+            end
+            table.sort(candidates, function(a, b) return a.d < b.d end)
+            for index = 1, math.min(#candidates, extras) do
+                task.wait()
+                if not S.running then break end
+                pull(candidates[index].model, false)
+            end
+        end
+    end
+    S.napeParts = placed
+    S.cluster = placed
+    return placed
+end
+
+local function restoreNapes()
+    Pin.stop(nil)
+    local restored = 0
+    for part, entry in pairs(napeStock) do
+        if entry.detached and entry.reattach then pcall(entry.reattach, entry, false) end
+        if part and part.Parent then
+            if pcall(function() part.Size = entry.size end) then restored = restored + 1 end
+        end
+        napeStock[part] = nil
+    end
+    S.napeParts = 0
+    S.jointsOff = 0
+    return restored
+end
+
+local function pruneNapes()
+    local now = clock()
+    for part, entry in pairs(napeStock) do
+        local record = entry.detached
+        -- Detached napes reattach on their own after 0.22s; this catches ones
+        -- whose timer could not run (titan death, target switch, error).
+        local stale = record and (now - (record.at or now) > 0.6 or dead(record.model))
+        if part == nil or part.Parent == nil or stale then
+            if record and entry.reattach then pcall(entry.reattach, entry, false) end
+            if part == nil or part.Parent == nil then napeStock[part] = nil end
+        end
+    end
+end
+--============================================================================
+local Hover = { base = nil, goal = nil, face = nil, conn = nil, phase = 0 }
+
+local function setOwner(name)
+    S.owner = name
+    if name ~= "farm" then
+        Hover.goal, Hover.base = nil, nil
+    end
+end
+
+local function hoverStep(dt)
+    if not S.running or S.owner ~= "farm" or not Hover.base then
+        Hover.goal = nil
+        return
+    end
+    local _, root = myChar()
+    if not root then return end
+    local step = math.clamp(dt or 0, 0, 0.1)
+    Hover.phase = (Hover.phase or 0) + step * (cfg.bobHz or 1.5) * 6.28318
+    local bob = math.sin(Hover.phase) * (cfg.bobAmp or 2)
+    local goal = Hover.base + Vector3.new(0, bob, 0)
+    Hover.goal = goal
+
+    -- CFrame.new(goal) alone resets rotation to identity every frame. Keep the
+    -- current upright rotation, and face the titan horizontally when there is
+    -- an offset to face.
+    local rotation = root.CFrame.Rotation
+    local look = rotation.LookVector
+    local flatLook = Vector3.new(look.X, 0, look.Z)
+    if flatLook.Magnitude > 0.01 then
+        rotation = CFrame.lookAt(Vector3.zero, flatLook)
+    end
+    local face = Hover.face
+    if face then
+        local dx, dz = face.X - goal.X, face.Z - goal.Z
+        if dx * dx + dz * dz > 4 then
+            rotation = CFrame.lookAt(Vector3.zero, Vector3.new(dx, 0, dz))
+        end
+    end
+
+    pcall(function()
+        root.CFrame = CFrame.new(goal) * rotation
+        -- Velocity feeds the game's damage formula. Do not touch it by
+        -- default; zeroVelocity and fallLimit are explicit A/B switches.
+        local velocity = root.AssemblyLinearVelocity
+        if cfg.zeroVelocity then
+            if S.swingBoostUntil and clock() < S.swingBoostUntil then
+                root.AssemblyLinearVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+            else
+                root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            end
+        else
+            local limit = tonumber(cfg.fallLimit) or 0
+            if limit > 0 and velocity.Y < -limit then
+                root.AssemblyLinearVelocity = Vector3.new(velocity.X, -limit, velocity.Z)
+            end
+        end
+    end)
+end
+
+local function hoverLoop()
+    if Hover.conn then return end
+    Hover.conn = RunService.Heartbeat:Connect(safe(function(dt)
+        pcall(hoverStep, dt)
+    end, "connect"))
+end
+
+local function hoverStop()
+    if Hover.conn then pcall(function() Hover.conn:Disconnect() end) end
+    Hover.conn = nil
+    Hover.goal, Hover.base, Hover.face = nil, nil, nil
+    S.owner = nil
+    S.swingBoostUntil = nil
+end
+
+local function hoverAt(root, point, height)
+    local base = Vector3.new(point.X, point.Y + height, point.Z)
+    -- Keep the bob phase while the base stays on the same titan; reset only on
+    -- the first write or a far target switch.
+    if not Hover.base or (Hover.base - base).Magnitude > 50 then
+        Hover.phase = 0
+    end
+    S.owner = "farm"
+    Hover.base = base
+    Hover.face = point
+    Hover.goal = base
+    hoverLoop()
+end
+
+local function aimAt(root, camera, point)
+    -- Off by default: the 10 Hz camera write fights the player's own camera and
+    -- was the source of the shake. cameraLock turns it back on deliberately.
+    if not cfg.cameraLock then return end
+    if camera then
+        pcall(function()
+            local from = camera.CFrame.Position
+            if (point - from).Magnitude > 0.05 then
+                camera.CFrame = CFrame.lookAt(from, point)
+            end
+        end)
+    end
+end
+
+local function travel(point)
+    local _, root = myChar()
+    if not root then return false end
+    S.owner = "farm"
+    Hover.base = point
+    Hover.face = nil
+    local hrp = S.target and S.target.model
+        and S.target.model:FindFirstChild("HumanoidRootPart")
+    if hrp then Hover.face = hrp.Position end
+    Hover.goal = point
+    hoverLoop()
+    return true
+end
+--============================================================================
+local Refill = {
+    tries = 0, nextPress = 0, until_ = 0, cycles = 0, attempt = nil,
+    reloadStarted = 0, reloadNextPress = 0, reloadTries = 0,
+    reloadSets = nil, reloadDurability = nil,
+    settleUntil = 0, lastSets = nil, lastDurability = nil,
+    decision = "idle", why = "not checked",
+    attempts = 0, failures = 0, maxSets = 3, lastMethod = "-", lastHold = 0,
+    holding = false, holdUntil = 0, nextTry = 0, stationScan = 0,
+}
+
+-- The HUD durability is the gradient on Blades.Inner.Bar. Empty is about 0,
+-- full is about 1.0; the old exact Transparency == 1 check missed settled blades.
+function Refill.readBlades(char)
+    if not char then return nil end
+    local blades = hudNode(hudTop(), "Blades")
+    local gradient = nil
+    if blades then
+        local inner = blades:FindFirstChild("Inner")
+        local bar = inner and inner:FindFirstChild("Bar")
+        gradient = bar and bar:FindFirstChild("Gradient")
+        if not gradient then
+            local found = blades:FindFirstChild("Gradient", true)
+            if found and found:IsA("UIGradient") then gradient = found end
+        end
+    end
+    if gradient then
+        local okX, x = pcall(function() return gradient.Offset.X end)
+        local okY, y = pcall(function() return gradient.Offset.Y end)
+        if okX and type(x) == "number" and x == x then
+            S.durabilityX, S.durabilityY = x, okY and y or nil
+            S.durabilitySource = "gradient"
+            S.durability = x
+            S.bladesBroken = x <= 0.02
+            return x
+        end
+    end
+
+    local total, clear = 0, 0
+    local rig = char and char:FindFirstChild("Rig_" .. lp.Name)
+    local left = rig and rig:FindFirstChild("LeftHand")
+    local right = rig and rig:FindFirstChild("RightHand")
+    for _, hand in ipairs({ left, right }) do
+        if hand then
+            for index = 1, 7 do
+                local blade = hand:FindFirstChild("Blade_" .. index)
+                if blade then
+                    total = total + 1
+                    local ok, transparency = pcall(function() return blade.Transparency end)
+                    if ok and type(transparency) == "number" and transparency >= 0.95 then
+                        clear = clear + 1
+                    end
+                end
+            end
+        end
+    end
+    S.durabilityX, S.durabilityY = nil, nil
+    if total == 0 then
+        S.durabilitySource = "none"
+        S.durability = nil
+        S.bladesBroken = false
+        return nil
+    end
+    S.durabilitySource = "blades"
+    S.bladesBroken = total == 14 and clear == 14
+    -- Transparency 1 means a spent blade, so invert the clear count.
+    S.durability = (total - clear) / total
+    return S.durability
+end
+
+local function manualMove()
+    local ok, down = pcall(function()
+        return UserInput:IsKeyDown(Enum.KeyCode.W)
+            or UserInput:IsKeyDown(Enum.KeyCode.A)
+            or UserInput:IsKeyDown(Enum.KeyCode.S)
+            or UserInput:IsKeyDown(Enum.KeyCode.D)
+    end)
+    return ok and down or false
+end
+
+local function refillCounts()
+    local hudText = hudSetsText()
+    local sets = tonumber(string.match(tostring(hudText), "(%d+)"))
+    local attr = nil
+    pcall(function() attr = tonumber(lp:GetAttribute("Refills")) end)
+    S.refills, S.refillsAttr, S.refillsText = sets, attr, hudText
+    return sets, attr, hudText
+end
+
+local function refillReason(sets, broken)
+    if not broken then
+        if sets == 0 then return nil, "idle", "sets 0; blades not fully broken" end
+        if S.durability == nil then return nil, "idle", "blades unreadable" end
+        if S.durability >= 0.99 then return nil, "idle", "blades full" end
+        return nil, "idle", "blades partly worn"
+    end
+    if sets == nil then return nil, "idle", "fully broken; HUD sets unreadable" end
+    if sets >= 1 then
+        if cfg.autoReload == false then return nil, "idle", "fully broken; auto reload off" end
+        return "reload", "reload", "fully broken; " .. tostring(sets) .. " spare set(s)"
+    end
+    if cfg.refill ~= true then return nil, "idle", "last blade; auto refill off" end
+    return "refill", "refill", "last blade; sets 0"
+end
+
+local function findPrompt(part)
+    if not part then return nil end
+    for _, descendant in ipairs(part:GetDescendants()) do
+        if descendant:IsA("ProximityPrompt") and descendant.Enabled ~= false then return descendant end
+    end
+    local parent = part.Parent
+    if parent then
+        for _, descendant in ipairs(parent:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt") and descendant.Enabled ~= false then
+                return descendant
+            end
+        end
+    end
+    return nil
+end
+
+-- R is a hold, not a tap. Keep it down between ticks so the station sees a
+-- continuous hold, and release it the moment the blades are full.
+local function refillKeyDown()
+    if Refill.holding then return true end
+    if not keyDown(Enum.KeyCode.R) then return false end
+    Refill.holding = true
+    return true
+end
+
+local function refillKeyUp()
+    if not Refill.holding then return end
+    Refill.holding = false
+    keyUp(Enum.KeyCode.R)
+end
+
+-- HUD text is "3 / 3": the part after the slash is the maximum.
+local function refillMaxSets(text)
+    local _, maximum = string.match(tostring(text or ""), "(%d+)%s*/%s*(%d+)")
+    local value = tonumber(maximum)
+    if value and value > 0 then return value end
+    return 3
+end
+
+local function refillTeleport(root, part)
+    if not root or not part then return false end
+    return pcall(function()
+        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    end)
+end
+
+-- One attempt: teleport to the station, then hold R or fire the prompt.
+-- Successive attempts alternate methods; a bare station just keeps using R.
+local function refillAttempt(now, root, sets, durability, gas)
+    local part = refillPart()
+    if not part then
+        -- 0 is truthy in Lua, so the first scan must be initialised explicitly.
+        if not Refill.stationScan or Refill.stationScan == 0 then
+            Refill.stationScan = now
+        end
+        if now - Refill.stationScan < 10 then
+            S.state = "refill: looking for a gas station"
+            S.refillMsg = S.state
+            return true
+        end
+        refillKeyUp()
+        Refill.attempt, Refill.failures, Refill.stationScan = nil, 0, 0
+        S.refilling = false
+        Refill.until_ = now + 30
+        setOwner(nil)
+        S.state = "refill: no gas station on this map"
+        S.refillMsg, S.autoMsg = S.state, S.state
+        say(S.state)
+        return true
+    end
+    Refill.stationScan = 0
+
+    Refill.attempts = (Refill.attempts or 0) + 1
+    local prompt = findPrompt(part)
+    local method = "key"
+    if Refill.attempts % 2 == 0 and prompt and caps.prompt then method = "prompt" end
+    local hold = math.max(0.5, math.min(10, tonumber(cfg.refillHold) or 3))
+    Refill.attempt = {
+        started = now, progressAt = now, method = method, part = part, hold = hold,
+        sets = sets, durability = durability, gas = gas,
+    }
+    Refill.lastMethod, Refill.lastHold = method, hold
+    Refill.holdUntil = now + hold
+    S.refilling, S.reloading = true, false
+    setOwner("refill")
+    local _, rootNow = myChar()
+    refillTeleport(rootNow or root, part)
+    if method == "prompt" then
+        pcall(function() prompt.HoldDuration = 0 end)
+        pcall(fireproximityprompt, prompt)
+    else
+        refillKeyDown()
+    end
+    S.refillMsg = string.format("attempt %d %s hold %.1fs", Refill.attempts, method, hold)
+    S.state = S.refillMsg
+    return true
+end
+
+local function refillCancel(reason)
+    refillKeyUp()
+    Refill.attempt = nil
+    Refill.nextTry, Refill.stationScan = 0, 0
+    S.refilling = false
+    Refill.settleUntil = 0
+    setOwner(nil)
+    S.state, S.refillMsg = reason, reason
+    Refill.decision, Refill.why = "idle", reason
+    return false
+end
+
+local function refillTick(now, root)
+    local durability = Refill.readBlades(localChar())
+    local sets, attr, hudText = refillCounts()
+    local gas = gasPercent()
+    if gas ~= nil then S.gas = gas end
+    gas = gas or S.gas
+    local broken = S.bladesBroken == true
+
+    -- Manual movement wins over both actions. Drop the attempt and give the
+    -- player a few seconds before the farm takes the character back.
+    if (S.refilling or S.reloading) and manualMove() then
+        if S.refilling then
+            -- Keep the refill alive, but hand the character back for 3 s.
+            refillKeyUp()
+            Refill.attempt = nil
+            Refill.nextTry = now + 0.5
+            Refill.settleUntil = 0
+            S.refillPauseUntil = now + 3
+            setOwner(nil)
+            S.state = "refill paused - manual move (3s)"
+            S.refillMsg = S.state
+            Refill.decision, Refill.why = "locked", "manual move"
+            say(S.refillMsg)
+            return true
+        end
+        Refill.attempt = nil
+        S.refilling, S.reloading = false, false
+        Refill.until_ = now + math.max(3, cfg.refillCooldown or 12)
+        Refill.settleUntil = 0
+        S.refillPauseUntil = now + 3
+        setOwner(nil)
+        S.state = "reload cancelled - manual move"
+        S.refillMsg = S.state
+        Refill.decision, Refill.why = "locked", S.state
+        say(S.refillMsg)
+        return true
+    end
+
+    if S.refilling and cfg.refill ~= true then
+        return refillCancel("auto refill OFF - station attempt cancelled")
+    end
+    if S.reloading and cfg.autoReload == false then
+        S.reloading = false
+        S.state = "auto reload OFF - reload cancelled"
+        S.refillMsg = S.state
+        return false
+    end
+
+    -- The bar tweens after a set/durability change. Do not trust it until it
+    -- has been stable for about one second.
+    local changed = false
+    if Refill.lastSets ~= nil and sets ~= Refill.lastSets then changed = true end
+    if Refill.lastDurability ~= nil and durability ~= Refill.lastDurability then changed = true end
+    if changed and (S.reloading or S.refilling) then
+        Refill.settleUntil = math.max(Refill.settleUntil or 0, now + 1)
+        Refill.reloadNextPress = math.max(Refill.reloadNextPress or 0, Refill.settleUntil)
+        Refill.nextPress = math.max(Refill.nextPress or 0, Refill.settleUntil)
+    end
+    Refill.lastSets, Refill.lastDurability = sets, durability
+
+    Refill.decision, Refill.why = "idle", "blades full"
+    S.refillReason = nil
+
+    if S.refilling then
+        Refill.maxSets = refillMaxSets(hudText)
+        if not S.running then return refillCancel("refill cancelled - farm stopped") end
+        if cfg.refill ~= true then return refillCancel("refill cancelled - auto refill OFF") end
+        if S.results then return refillCancel("refill cancelled - results screen") end
+        if currentKind() ~= "mission" then return refillCancel("refill cancelled - not in mission") end
+        local _, _, humanoid = myChar()
+        if not humanoid or humanoid.Health <= 0 then
+            return refillCancel("refill cancelled - dead")
+        end
+
+        local setsFull = sets ~= nil and sets >= Refill.maxSets
+        local bladesFull = durability ~= nil and durability >= 0.99
+        if setsFull and bladesFull then
+            refillKeyUp()
+            Refill.attempt = nil
+            Refill.failures, Refill.attempts = 0, 0
+            Refill.cycles, Refill.tries = 0, 0
+            S.refilling = false
+            Refill.until_ = now + 2
+            Refill.settleUntil = now + 1
+            setOwner(nil)
+            S.state = string.format("refilled (sets %d/%d, durability %.2f)",
+                sets, Refill.maxSets, durability)
+            S.refillMsg = S.state
+            S.autoMsg = S.state
+            say("refill success: " .. S.state)
+            return false
+        end
+
+        local attempt = Refill.attempt
+        if not attempt then
+            if now < (Refill.nextTry or 0) then return true end
+            return refillAttempt(now, root, sets, durability, gas)
+        end
+
+        Refill.decision = "refill"
+        Refill.why = string.format("attempt %d %s; need sets %d + durability 0.99",
+            Refill.attempts, attempt.method, Refill.maxSets)
+        S.refillReason = "decision refill - " .. Refill.why
+        S.state = string.format("refilling (sets %s/%d, durability %s, gas %s%%)",
+            tostring(sets), Refill.maxSets,
+            durability and string.format("%.2f", durability) or "-",
+            gas ~= nil and tostring(gas) or "?")
+
+        -- "No progress" means no change in sets, durability or gas. Any change
+        -- restarts the clock, so a slow refill is not cut off at 3 s.
+        if sets ~= attempt.sets or durability ~= attempt.durability or gas ~= attempt.gas then
+            attempt.sets, attempt.durability, attempt.gas = sets, durability, gas
+            attempt.progressAt = now
+        end
+
+        if attempt.method == "key" and Refill.holding and now >= (Refill.holdUntil or 0) then
+            refillKeyUp()
+        end
+
+        if now - (attempt.progressAt or attempt.started) >= 3 then
+            refillKeyUp()
+            Refill.attempt = nil
+            Refill.failures = (Refill.failures or 0) + 1
+            Refill.nextTry = now + 0.5
+            if Refill.failures % 5 == 0 then
+                refillObject = nil
+                S.refillMsg = string.format("attempt %d %s failed - rescanning station",
+                    Refill.attempts, attempt.method)
+            else
+                S.refillMsg = string.format("attempt %d %s failed (sets %s/%d, dur %s) - retrying",
+                    Refill.attempts, attempt.method, tostring(sets), Refill.maxSets,
+                    durability and string.format("%.2f", durability) or "-")
+            end
+            S.state = S.refillMsg
+            say(S.refillMsg)
+        end
+        return true
+    end
+
+    if S.reloading then
+        Refill.decision = "reload"
+        Refill.why = "holding R; need durability >= 0.99"
+        S.refillReason = "decision reload - " .. Refill.why
+        S.state = string.format("reloading (sets %s, durability %s)",
+            tostring(sets), durability and string.format("%.2f", durability) or "-")
+
+        if now < (Refill.settleUntil or 0) then return false end
+        local dropped = sets ~= nil and Refill.reloadSets ~= nil and sets < Refill.reloadSets
+        if (durability ~= nil and durability >= 0.99) or (durability == nil and dropped) then
+            S.reloading = false
+            Refill.settleUntil = now + 1
+            Refill.cycles, Refill.tries = 0, 0
+            Refill.reloadStarted, Refill.reloadNextPress, Refill.reloadTries = 0, 0, 0
+            S.state = string.format("reloaded (sets %s, dropped=%s, durability %s)",
+                tostring(sets), tostring(dropped),
+                durability and string.format("%.2f", durability) or "-")
+            S.refillMsg = S.state
+            S.autoMsg = S.state
+            say(S.state)
+            return false
+        end
+        if now - (Refill.reloadStarted or now) >= 4 then
+            S.reloading = false
+            Refill.settleUntil = now + 1
+            Refill.until_ = now + 1
+            Refill.reloadStarted, Refill.reloadNextPress, Refill.reloadTries = 0, 0, 0
+            S.state = string.format("reload timeout (sets %s, dropped=%s, durability %s)",
+                tostring(sets), tostring(dropped),
+                durability and string.format("%.2f", durability) or "-")
+            S.refillMsg = S.state
+            S.autoMsg = S.state
+            say(S.state)
+            return false
+        end
+        if now >= (Refill.reloadNextPress or 0) then
+            keyTap(Enum.KeyCode.R, 0.5)
+            Refill.reloadTries = (Refill.reloadTries or 0) + 1
+            Refill.reloadNextPress = now + 1.0
+        end
+        return false
+    end
+
+    if now < (Refill.until_ or 0) and broken and sets == 0 then
+        Refill.decision, Refill.why = "locked", "refill cooldown"
+        S.refillReason = "decision locked - " .. Refill.why
+        S.refilling, S.reloading = false, false
+        return false
+    end
+
+    if now < (Refill.settleUntil or 0) then
+        Refill.decision, Refill.why = "locked", "settle wait"
+        S.refillReason = "decision locked - " .. Refill.why
+        return false
+    end
+
+    if manualMove() then
+        Refill.decision, Refill.why = "locked", "manual move"
+        S.refillReason = "decision locked - " .. Refill.why
+        return false
+    end
+
+    local reason, decision, why = refillReason(sets, broken)
+    Refill.decision, Refill.why = decision or "idle", why or "blades full"
+    S.refillReason = string.format("decision %s - %s", Refill.decision, Refill.why)
+    if not reason then
+        if Refill.attempt then
+            Refill.attempt = nil
+            S.refilling = false
+            setOwner(nil)
+        end
+        Refill.cycles = 0
+        return false
+    end
+
+    if reason == "reload" then
+        Refill.reloadStarted = now
+        Refill.reloadNextPress = now
+        Refill.reloadTries = 0
+        Refill.reloadSets, Refill.reloadDurability = sets, durability
+        Refill.settleUntil = 0
+        S.reloading, S.refilling = true, false
+        -- Keep the existing hover base owned by the farm while R is held. The
+        -- Heartbeat hover writer keeps running through the whole reload.
+        if root then
+            Hover.base = root.Position
+            Hover.goal = root.Position
+            Hover.face = nil
+            S.owner = "farm"
+            hoverLoop()
+        end
+        S.state = string.format("reloading (sets %s, durability %s)",
+            tostring(sets), durability and string.format("%.2f", durability) or "-")
+        S.refillMsg = S.state
+        say(S.state)
+        keyTap(Enum.KeyCode.R, 0.5)
+        Refill.reloadTries = 1
+        Refill.reloadNextPress = now + 1.0
+        return false
+    end
+
+    -- reason == "refill": enter the station loop. It stays in control until
+    -- the blades are full, a stop condition fires, or the station is not there.
+    Refill.attempts, Refill.failures = 0, 0
+    Refill.nextTry, Refill.stationScan = 0, 0
+    Refill.lastMethod, Refill.lastHold = "-", 0
+    Refill.maxSets = refillMaxSets(hudText)
+    S.refilling, S.reloading = true, false
+    setOwner("refill")
+    say("refill: " .. tostring(S.refillReason))
+    return refillAttempt(now, root, sets, durability, gas)
+end
+
+--============================================================================
+--  MINIMAL RETRY
+--============================================================================
+local Retry = {
+    tries = 0, last = nil, method = 0, active = false,
+    lastMethod = nil, lastResult = nil, lastLabel = nil,
+}
+
+function Retry.note(event, detail)
+    local line = string.format("%s | %-16s | tries=%s method=%s | %s",
+        os.date("%Y-%m-%d %H:%M:%S"), tostring(event), tostring(Retry.tries or 0),
+        tostring(Retry.lastMethod or "-"), tostring(detail or ""))
+    print("[AOTR retry] " .. line)
+end
+
+--============================================================================
+--  FLIGHT RECORDER
+--============================================================================
+local Exit = { frames = {}, max = 40, started = false, token = 0 }
+
+function Exit.stop()
+    Exit.token = (Exit.token or 0) + 1
+    Exit.started = false
+end
+
+function Exit.attr(name)
+    local ok, value = pcall(function() return workspace:GetAttribute(name) end)
+    if ok then return value end
+    return nil
+end
+
+function Exit.clean(value)
+    if value == nil then return "-" end
+    local text = tostring(value)
+    return (string.gsub(text, "[|\r\n]", "/"))
+end
+
+function Exit.aliveTitans()
+    local folder = workspace:FindFirstChild("Titans")
+    if not folder then return 0 end
+    local count = 0
+    for _, model in ipairs(folder:GetChildren()) do
+        if model:IsA("Model") and not dead(model) then count = count + 1 end
+    end
+    return count
+end
+
+function Exit.playerHealth()
+    local _, _, humanoid = myChar()
+    if not humanoid then return "-" end
+    local ok, health = pcall(function() return humanoid.Health, humanoid.MaxHealth end)
+    if not ok or health == nil then return "-" end
+    local okMax, maximum = pcall(function() return humanoid.MaxHealth end)
+    return string.format("%s/%s", tostring(math.floor(tonumber(health) or 0)),
+        tostring(math.floor(tonumber(okMax and maximum or 0) or 0)))
+end
+
+function Exit.retryState()
+    return string.format("tries=%d method=%s result=%s label=%s", Retry.tries or 0,
+        Exit.clean(Retry.lastMethod), Exit.clean(Retry.lastResult), Exit.clean(Retry.lastLabel))
+end
+
+function Exit.snapshot()
+    local target = S.target
+    local players = Exit.attr("Player_Count")
+    if players == nil then players = #Players:GetPlayers() end
+    return string.format(
+        "%s kind=%s type=%s obj=%s sec=%s players=%s alive=%d | state=%s target=%s noHit=%s wd=%s "
+            .. "path=%s pin=%s gas=%s sets=%s blades=%s | results=%s%s retry=%s | auto=%s err=%s hp=%s",
+        os.date("%H:%M:%S"), Exit.clean(currentKind()), Exit.clean(Exit.attr("Type")),
+        Exit.clean(Exit.attr("Objective")), Exit.clean(Exit.attr("Seconds")), Exit.clean(players),
+        Exit.aliveTitans(), Exit.clean(S.state), Exit.clean(target and target.name or "none"),
+        tostring(S.swingsNoHit or 0), tostring(S.watchdogStage or 0),
+        Exit.clean(Path.locked), Pin.active and "ON" or "OFF", Exit.clean(S.gas),
+        Exit.clean(S.refills), S.bladesBroken and "broken" or "ok",
+        tostring(S.results == true), S.resultsAtText and ("@" .. S.resultsAtText) or "",
+        Exit.retryState(), Exit.clean(S.autoMsg), Exit.clean(S.err), Exit.playerHealth())
+end
+
+function Exit.bottom(count)
+    local lines = {}
+    local from = math.max(1, #Exit.frames - (count or 10) + 1)
+    for index = from, #Exit.frames do lines[#lines + 1] = Exit.frames[index] end
+    return lines
+end
+
+function Exit.lastText(count)
+    return table.concat(Exit.bottom(count or Exit.max), "\n")
+end
+
+function Exit.copyFlight(count)
+    local text = Exit.lastText(count or Exit.max)
+    local copied = false
+    if type(setclipboard) == "function" then
+        copied = pcall(setclipboard, text)
+    end
+    if not copied and caps.writefile then
+        pcall(writefile, "aotr_flight_last40.txt", text)
+    end
+    return text, copied
+end
+
+function Exit.writeLast(tag, detail)
+    local stamp = os.date("%H:%M:%S")
+    local lines = {
+        "AOTR internal v" .. VERSION .. " exit recorder " .. os.date("%Y-%m-%d %H:%M:%S"),
+        "tag: " .. tostring(tag),
+        "detail: " .. Exit.clean(detail),
+        "last 10 flight entries:",
+    }
+    local recent = Exit.bottom(10)
+    if #recent == 0 then
+        local okSnap, line = pcall(Exit.snapshot)
+        recent = { okSnap and line or ("snapshot error: " .. tostring(line)) }
+    end
+    for _, line in ipairs(recent) do lines[#lines + 1] = line end
+    local all = Exit.bottom(Exit.max)
+    if #all > #recent then
+        lines[#lines + 1] = "last " .. tostring(#all) .. " flight entries:"
+        for _, line in ipairs(all) do lines[#lines + 1] = line end
+    end
+    local body = table.concat(lines, "\n")
+    S.lastExit = tostring(tag) .. " at " .. stamp .. " (" .. Exit.clean(detail) .. ")"
+    print(body)
+    if caps.writefile then pcall(writefile, "aotr_lastexit.txt", body) end
+    return body
+end
+
+function Exit.results(signature)
+    S.resultsAt = clock()
+    S.resultsAtText = os.date("%H:%M:%S")
+    S.autoMsg = "results screen at " .. S.resultsAtText
+    say(S.autoMsg)
+    Exit.frames[#Exit.frames + 1] = "RESULTS " .. S.resultsAtText .. " " .. Exit.clean(signature)
+    while #Exit.frames > Exit.max do table.remove(Exit.frames, 1) end
+    if caps.writefile then pcall(writefile, "aotr_flight.log", table.concat(Exit.frames, "\n")) end
+end
+
+function Exit.markGame(source, detail)
+    local tag = "NOT SCRIPT-INITIATED"
+    local text = tostring(source) .. ": " .. tostring(detail or "")
+    if S.gameExitAt and clock() - S.gameExitAt <= 3 and S.gameExitText then
+        text = S.gameExitText .. " | " .. text
+    end
+    S.gameExitAt, S.gameExitText = clock(), text
+    S.autoMsg = tag .. " (" .. tostring(source) .. ")"
+    pcall(Exit.writeLast, tag, text)
+    say("[exit] " .. tag .. " " .. tostring(source) .. ": " .. tostring(detail or ""))
+end
+
+function Exit.start()
+    if Exit.started then return true end
+    Exit.started = true
+    Exit.token = (Exit.token or 0) + 1
+    local token = Exit.token
+    local okSnap, first = pcall(Exit.snapshot)
+    Exit.frames = { okSnap and first or ("snapshot error: " .. tostring(first)) }
+    if caps.writefile then
+        pcall(writefile, "aotr_flight.log", table.concat(Exit.frames, "\n"))
+    end
+    safeSpawn(function()
+        local lastKind = currentKind()
+        while Exit.token == token do
+            task.wait(2)
+            local kind = currentKind()
+            if kind ~= lastKind then
+                if lastKind == "mission" and (kind == "lobby" or kind == "menu" or kind == "trade") then
+                    Exit.markGame("place change", lastKind .. " -> " .. kind)
+                end
+                lastKind = kind
+            end
+            local ok, line = pcall(Exit.snapshot)
+            Exit.frames[#Exit.frames + 1] = ok and line or ("snapshot error: " .. tostring(line))
+            while #Exit.frames > Exit.max do table.remove(Exit.frames, 1) end
+            if caps.writefile then pcall(writefile, "aotr_flight.log", table.concat(Exit.frames, "\n")) end
+        end
+    end)
+    pcall(function()
+        lp.OnTeleport:Connect(safe(function(teleportType, placeId, spawnName)
+            Exit.markGame("lp.OnTeleport", tostring(teleportType) .. " place=" .. tostring(placeId)
+                .. " spawn=" .. tostring(spawnName))
+        end, "connect"))
+    end)
+    pcall(function()
+        local service = game:GetService("TeleportService")
+        service.TeleportInitFailed:Connect(safe(function(player, result, message)
+            if player ~= nil and player ~= lp then return end
+            Exit.markGame("TeleportInitFailed", tostring(result) .. " " .. tostring(message))
+        end, "connect"))
+    end)
+    pcall(function()
+        local gui = game:GetService("GuiService")
+        if gui and gui.ErrorMessageChanged then
+            gui.ErrorMessageChanged:Connect(safe(function(message)
+                if type(message) == "string" and message ~= "" then
+                    Exit.markGame("GuiService.ErrorMessageChanged", message)
+                end
+            end, "connect"))
+        end
+    end)
+    return true
+end
+
+-- Retry rungs, rotated in this order until the results screen is gone. Every
+-- attempt is re-verified; firing a signal is not treated as success.
+local RETRY_METHODS = { "connections", "input", "gamepad" }
+
+local function retryAnchors()
+    local playerGui = getPlayerGui()
+    local interface = playerGui and playerGui:FindFirstChild("Interface")
+    local rewards = interface and interface:FindFirstChild("Rewards")
+    local scope = rewards or playerGui
+    local anchors = {}
+    if not scope then return anchors end
+    for _, instance in ipairs(scope:GetDescendants()) do
+        local okLabel, isLabel = pcall(function()
+            return instance:IsA("TextLabel") or instance:IsA("TextButton")
+        end)
+        if okLabel and isLabel and guiVisible(instance) and not isOurs(instance) then
+            local okText, text = pcall(function() return instance.Text end)
+            if okText and type(text) == "string" then
+                local flat = normText(text)
+                if string.find(flat, "retry", 1, true)
+                    and not string.find(flat, "leave", 1, true)
+                    and not string.find(flat, "modif", 1, true) then
+                    anchors[#anchors + 1] = instance
+                end
+            end
+        end
+    end
+    return anchors
+end
+
+local function retryCandidates()
+    local playerGui = getPlayerGui()
+    local interface = playerGui and playerGui:FindFirstChild("Interface")
+    local rewards = interface and interface:FindFirstChild("Rewards")
+    local found, seen = {}, {}
+    local function collect(scope)
+        for _, button in ipairs(GuiAuto.findAll({ "retry", "again" }, scope, { "leave", "modify" })) do
+            if not seen[button] then
+                seen[button] = true
+                found[#found + 1] = button
+            end
+        end
+    end
+    if rewards then collect(rewards) end
+    collect(nil)
+    return found
+end
+
+-- What a hand click actually hits at the visible RETRY text. The clickable
+-- surface is often a bare overlay with no text, so matching button text alone
+-- can land on a decorative duplicate that does nothing.
+local function retryTargets()
+    local targets, seen = {}, {}
+    local function add(instance)
+        if not instance or seen[instance] then return end
+        local ok, isButton = pcall(function() return instance:IsA("GuiButton") end)
+        if ok and isButton and not isOurs(instance) then
+            seen[instance] = true
+            targets[#targets + 1] = instance
+        end
+    end
+    for _, anchor in ipairs(retryAnchors()) do
+        local point = GuiAuto.centre(anchor)
+        if point then
+            local top = GuiAuto.topAt(point.X, point.Y)
+            if top and not GuiAuto.matches(top, { "leave", "modif", "back", "close" }) then
+                add(top)
+            end
+        end
+        add(anchor)
+    end
+    for _, button in ipairs(retryCandidates()) do
+        local reached = GuiAuto.hits(button)
+        if reached then add(button) end
+    end
+    return targets
+end
+
+local function retryButton()
+    return retryTargets()[1]
+end
+
+local function retryLabel(button)
+    if not button then return "-" end
+    local text = ""
+    local ok, value = pcall(function() return button.Text end)
+    if ok and type(value) == "string" then text = value end
+    if text == "" then
+        local okChild, child = pcall(function() return button:FindFirstChildWhichIsA("TextLabel", true) end)
+        if okChild and child then
+            local okText, childText = pcall(function() return child.Text end)
+            if okText and type(childText) == "string" then text = childText end
+        end
+    end
+    text = (string.gsub(tostring(text), "[\r\n]+", " "))
+    if #text > 22 then text = string.sub(text, 1, 22) end
+    return text ~= "" and text or "-"
+end
+
+-- A real InputObject cannot be constructed from a script, so the handler gets a
+-- table carrying the fields a click handler reads; a bare call is retried when
+-- that throws.
+local function retryInput(button)
+    local point = GuiAuto.centre(button)
+    local position = point and Vector3.new(point.X, point.Y, 0) or Vector3.new(0, 0, 0)
+    return {
+        UserInputType = Enum.UserInputType.MouseButton1,
+        UserInputState = Enum.UserInputState.Begin,
+        KeyCode = Enum.KeyCode.Unknown,
+        Position = position,
+        Delta = Vector3.new(0, 0, 0),
+    }
+end
+
+local function retryFire(button)
+    if not caps.getconnections then return false, "no getconnections" end
+    local fake = retryInput(button)
+    local fired, seen = 0, 0
+    for _, name in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down", "MouseButton1Up" }) do
+        local ok, list = pcall(getconnections, button[name])
+        if ok and type(list) == "table" then
+            for _, connection in ipairs(list) do
+                if connection.Enabled ~= false then
+                    seen = seen + 1
+                    local okFire = pcall(function() connection:Fire(fake) end)
+                    if not okFire then okFire = pcall(function() connection:Fire() end) end
+                    if okFire then fired = fired + 1 end
+                end
+            end
+        end
+    end
+    return fired > 0, string.format("connections %d/%d", fired, seen)
+end
+
+-- AbsolutePosition includes the top inset when the ScreenGui does not ignore
+-- it, while injected mouse coordinates start at the top of the window.
+local function retryPoint(button)
+    local point = GuiAuto.centre(button)
+    if not point then return nil end
+    local x, y = point.X, point.Y
+    local ignore = false
+    pcall(function()
+        local gui = button:FindFirstAncestorWhichIsA("ScreenGui")
+        ignore = gui ~= nil and gui.IgnoreGuiInset == true
+    end)
+    if not ignore then
+        local inset = 0
+        pcall(function()
+            local value = game:GetService("GuiService"):GetGuiInset()
+            if value then inset = value.Y or 0 end
+        end)
+        y = y - inset
+    end
+    return x, y
+end
+
+-- Real synthetic click: unlock the pointer first, click, restore what the farm
+-- had so aiming keeps working afterwards.
+local function retryClick(button)
+    if not caps.vim then return false, "no vim" end
+    local x, y = retryPoint(button)
+    if not x then return false, "no position" end
+    local uis = game:GetService("UserInputService")
+    local okBehavior, behavior = pcall(function() return uis.MouseBehavior end)
+    local okIcon, icon = pcall(function() return uis.MouseIconEnabled end)
+    pcall(function() uis.MouseBehavior = Enum.MouseBehavior.Default end)
+    pcall(function() uis.MouseIconEnabled = true end)
+    local ok = pcall(function()
+        caps.vim:SendMouseMoveEvent(x, y, 0, game)
+        task.wait(0.05)
+        caps.vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.08)
+        caps.vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    task.wait(0.2)
+    pcall(function()
+        if okIcon and icon ~= nil then uis.MouseIconEnabled = icon end
+        if okBehavior and behavior then uis.MouseBehavior = behavior end
+    end)
+    return ok, string.format("vim %d,%d", x, y)
+end
+
+-- Gamepad-style activation: select the button, send Return, then clear it.
+local function retryGamepad(button)
+    local gui = game:GetService("GuiService")
+    local okPrev, previous = pcall(function() return gui.SelectedObject end)
+    if not pcall(function() gui.SelectedObject = button end) then
+        return false, "select failed"
+    end
+    local sent = false
+    if caps.vim then
+        sent = pcall(function()
+            caps.vim:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+            task.wait(0.06)
+            caps.vim:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+        end)
+    end
+    task.wait(0.15)
+    pcall(function() gui.SelectedObject = (okPrev and previous) or nil end)
+    if not sent then return false, "gamepad no vim" end
+    return true, "gamepad return"
+end
+
+local function retryRewards()
+    local playerGui = getPlayerGui()
+    local interface = playerGui and playerGui:FindFirstChild("Interface")
+    return interface and interface:FindFirstChild("Rewards")
+end
+
+local function retryGone(button)
+    local rewards = retryRewards()
+    if not rewards or not rewards.Parent then return true, "rewards gone" end
+    local okVisible, visible = pcall(function() return rewards.Visible end)
+    if okVisible and visible == false then return true, "rewards hidden" end
+    if resultsSignature() == nil then return true, "results closed" end
+    if not button or not button.Parent then return true, "retry button gone" end
+    return false
+end
+
+-- One attempt: press, wait a second, then require the screen to actually change.
+local function retryVerify(beforeLabel, button)
+    task.wait(1)
+    local gone, why = retryGone(button)
+    local label = retryLabel(button)
+    if gone then return true, tostring(why) .. " label " .. label end
+    if label ~= beforeLabel and string.find(label, "1/1", 1, true) then
+        return true, "vote label " .. label
+    end
+    return false, "label " .. label
+end
+
+local function retryTick(now)
+    if now - (S.startedAt or now) < 1.5 then return end
+    local signature = resultsSignature()
+    if not signature then
+        S.results = false
+        if Retry.active then
+            Retry.active = false
+            Retry.note("closed", "results screen gone")
+            S.autoMsg = "auto: retry verified, results closed"
+        end
+        return
+    end
+    if not S.results then
+        S.results = true
+        Exit.results(signature)
+    end
+    if not cfg.autoRetry or not S.running then return end
+    local gap = math.max(0.5, math.min(2, tonumber(cfg.retryCooldown) or 1))
+    if Retry.last and now - Retry.last < gap then return end
+    Retry.active = true
+
+    local button = retryButton() or retryTargets()[1]
+    if not button then
+        Retry.last = clock()
+        Retry.lastMethod, Retry.lastResult, Retry.lastLabel = "none", "retry button not found", "-"
+        S.autoMsg = "auto: retry - button not found"
+        return
+    end
+    local before = retryLabel(button)
+    Retry.method = ((Retry.method or 0) % #RETRY_METHODS) + 1
+    local method = RETRY_METHODS[Retry.method]
+    Retry.tries = (Retry.tries or 0) + 1
+    S.retries = Retry.tries
+    local ok, detail
+    if method == "connections" then
+        ok, detail = retryFire(button)
+    elseif method == "input" then
+        ok, detail = retryClick(button)
+    else
+        ok, detail = retryGamepad(button)
+    end
+    local closed, why = retryVerify(before, button)
+    Retry.last = clock()
+    Retry.lastMethod = method
+    Retry.lastResult = tostring(detail) .. " -> " .. tostring(why)
+    Retry.lastLabel = retryLabel(retryButton() or button)
+    Retry.note(method, Retry.lastResult .. " fired=" .. tostring(ok))
+    S.state = "retry " .. tostring(method) .. " " .. tostring(detail)
+    S.autoMsg = "auto: " .. tostring(method) .. " " .. tostring(detail) .. " -> " .. tostring(why)
+    if closed then
+        say("retry verified: " .. tostring(why))
+    end
+end
+--============================================================================
+local SwingNet = { open = false }
+
+-- One variadic poster. post2/post3 silently dropped the fourth argument, so
+-- Hitboxes/Register never sent its time difference. Every argument is sent.
+local function post(...)
+    if not Net.post then return false, "POST RemoteEvent not found" end
+    local args = packArgs(...)
+    local ok, err = pcall(Net.post.FireServer, Net.post, table.unpack(args, 1, args.n))
+    return ok, err
+end
+
+-- The target nape always, plus the crowd around it when group hits are on.
+-- The server caps how many registers one swing is worth, so the list is short.
+local function napeList(nape, model)
+    local list = { nape }
+    if not cfg.multiHit or (S.cluster or 0) < cfg.multiMin then return list end
+    local okPos, centre = pcall(function() return nape.Position end)
+    if not okPos or not centre then return list end
+    local folder = workspace:FindFirstChild("Titans")
+    if not folder then return list end
+    local cap = math.max(1, math.min(6, cfg.napeMult or 6))
+    for _, other in ipairs(folder:GetChildren()) do
+        if #list >= cap then break end
+        if other:IsA("Model") and other ~= model and other ~= localChar() and not dead(other) then
+            local otherNape = napeOf(other)
+            if otherNape then
+                local ok, position = pcall(function() return otherNape.Position end)
+                if ok and position and (position - centre).Magnitude <= cfg.multiRadius then
+                    list[#list + 1] = otherNape
+                end
+            end
+        end
+    end
+    return list
+end
+--============================================================================
+local SlashButton = nil
+
+local function fireSignal(signal)
+    local fired, counted = false, false
+    if caps.getconnections then
+        local ok, connections = pcall(getconnections, signal)
+        if ok and type(connections) == "table" then
+            counted = true
+            for _, connection in ipairs(connections) do
+                if pcall(function() connection:Fire() end) then fired = true end
+            end
+        end
+    end
+    -- With getconnections available, an empty list is a definitive "nothing is
+    -- listening". Falling back to firesignal there reports success on a dead
+    -- signal - which is exactly how the farm stopped swinging: the log shows
+    -- the Slash button at down=0 up=0.
+    if counted then return fired end
+    if caps.firesignal then return (pcall(firesignal, signal)) end
+    return false
+end
+
+local function slashButton()
+    if SlashButton and SlashButton.Parent then return SlashButton end
+    SlashButton = nil
+    local gui = getPlayerGui()
+    if not gui then return nil end
+    local ok, all = pcall(function() return gui:GetDescendants() end)
+    if not ok or type(all) ~= "table" then return nil end
+    for _, instance in ipairs(all) do
+        if instance.Name == "Slash" and instance:IsA("GuiButton") then
+            SlashButton = instance
+            return instance
+        end
+    end
+    return nil
+end
+
+local function guiSwing()
+    local button = slashButton()
+    if not button then return false end
+    if not fireSignal(button.MouseButton1Down) then return false end
+    task.delay(0.03, function()
+        pcall(function() fireSignal(button.MouseButton1Up) end)
+    end)
+    return true
+end
+
+-- Returns how many calls were sent; a hit is only confirmed by HitSignal.
+local function remoteSwing(target)
+    if not target then return 0 end
+    local nape = target.nape
+    if not nape or not nape.Parent then
+        nape = napeOf(target.model)
+        target.nape = nape
+    end
+    if not nape or not nape.Parent then return 0 end
+    if cfg.remoteTemplate and Template.available() then
+        local sent = Template.replay(target, nape)
+        if sent > 0 then
+                    return sent
+        end
+    end
+    if not post("Attacks", "Slash", true) then return 0 end
+    SwingNet.open = true
+    -- The client releases a fraction of a second after the press; the server
+    -- expects both halves, so mirror that gap instead of firing one call.
+    task.delay(0.03, function()
+        SwingNet.open = false
+        post("Attacks", "Slash", false)
+    end)
+    local sent = 0
+    for _, part in ipairs(napeList(nape, target.model)) do
+        -- Time_Difference is the gap since the last release; post() forwards
+        -- every argument now, so the 0.12 actually reaches the server.
+        if post("Hitboxes", "Register", part, 0.12) then sent = sent + 1 end
+    end
+    return sent
+end
+--============================================================================
+local function attackReady()
+    if not S.running or S.refilling or S.reloading or S.results then return false end
+    if S.bladesBroken then return false end
+    if (Refill.settleUntil or 0) > clock() then return false end
+    local target = S.target
+    if not target or dead(target.model) then return false end
+    -- Measured to the titan, not the nape: right before a slash the nape is
+    -- still welded at the titan and attackTick is the thing that pulls it in.
+    if not S.titanDist then return false end
+    return S.titanDist <= (S.hoverNow or cfg.hover or 120) + 45
+end
+
+local function meterReset()
+    local M = S.meter
+    M.swings, M.damage, M.hits, M.kills, M.swingsSinceKill = 0, 0, 0, 0, 0
+    M.lastDamage, M.lastSpeed, M.lastPull, M.lastPullRan = 0, 0, "off", false
+    M.lastSwingBefore, M.lastSwingAfter, M.lastSwingAt = 0, 0, 0
+    M.lastHealth, M.watchHumanoid, M.deadCounted = nil, nil, false
+    M.recent, M.current, M.watch = {}, nil, nil
+end
+
+-- The confirmed hit signal is the only proof of damage; posted calls are not.
+local function meterTick()
+    local M = S.meter
+    if M.watch then HitSignal.check(M.watch) end
+    local humanoid = M.watchHumanoid
+    if not humanoid or not humanoid.Parent then return end
+    local health = tonumber(humanoid.Health)
+    if health == nil then return end
+    if M.lastHealth == nil then
+        M.lastHealth = health
+        return
+    end
+    if health <= 0 and (M.lastHealth or 0) > 0 and not M.deadCounted then
+        M.kills = M.kills + 1
+        M.swingsSinceKill = 0
+        M.deadCounted = true
+    end
+    M.lastHealth = health
+end
+
+local function noteSwing(pullRan, healthBefore, path)
+    local M = S.meter
+    local target = S.target
+    local humanoid = target and target.model and target.model:FindFirstChildOfClass("Humanoid")
+    local before = HitSignal.fast(target and target.model)
+    if healthBefore ~= nil then before.health = healthBefore end
+    M.swings = M.swings + 1
+    M.swingsSinceKill = M.swingsSinceKill + 1
+    M.lastSpeed = S.swingVel and S.swingVel.Magnitude or 0
+    M.lastPull = S.pullMethod or "off"
+    M.lastPullRan = pullRan == true
+    M.lastSwingBefore = healthBefore or (humanoid and humanoid.Health) or 0
+    M.lastSwingAfter = M.lastSwingBefore
+    M.lastDamage = 0
+    M.lastSwingAt = clock()
+    M.watchHumanoid = humanoid
+    M.lastHealth = M.lastSwingBefore
+    M.deadCounted = M.lastSwingBefore <= 0
+    M.watch = {
+        model = target and target.model, before = before, at = clock(),
+        damage = 0, hit = false, done = false, path = path,
+    }
+    local entry = {
+        at = clock(), before = M.lastSwingBefore, after = M.lastSwingBefore, damage = 0,
+        speed = M.lastSpeed, pull = M.lastPull, ran = M.lastPullRan, humanoid = humanoid,
+        path = path, confirmed = false,
+    }
+    M.recent[#M.recent + 1] = entry
+    while #M.recent > 20 do table.remove(M.recent, 1) end
+    M.current = entry
+end
+
+-- A swing succeeds only when HitSignal confirms a change inside 0.4 s. In auto
+-- mode the ladder tries gui -> remote -> mouse until one path confirms.
+local function executeSwing(countStats, pullRan)
+    local now = clock()
+    if S.slashReleaseAt and now < S.slashReleaseAt then return nil end
+    if S.nextSlashAt and now < S.nextSlashAt then return nil end
+    local target = S.target
+    if not target or not target.model then return nil end
+    local humanoid = target.model:FindFirstChildOfClass("Humanoid")
+    local healthBefore = humanoid and humanoid.Health or nil
+
+    -- Deliberate velocity for the hit that is about to be sent. The hover loop
+    -- only touches velocity when zeroVelocity or fallLimit is enabled.
+    if (cfg.swingSpeed or 0) > 0 then
+        local _, swingRoot = myChar()
+        if swingRoot then
+            local look = swingRoot.CFrame.LookVector
+            local flat = Vector3.new(look.X, 0, look.Z)
+            if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
+            swingRoot.AssemblyLinearVelocity = flat.Unit * cfg.swingSpeed
+            S.swingBoostUntil = clock() + 0.15
+        end
+    end
+    local _, velocityRoot = myChar()
+    S.swingVel = velocityRoot and velocityRoot.AssemblyLinearVelocity or nil
+    S.slashReleaseAt = clock() + 0.03
+    task.delay(0.03, function()
+        S.slashReleaseAt = nil
+        S.nextSlashAt = clock() + (cfg.attackDelay or 0.06)
+    end)
+
+    local explicit = (cfg.attackPath or "auto") ~= "auto"
+    local tries = explicit and 1 or #Path.order
+    local did, confirmed, totalDamage = nil, false, 0
+    for attempt = 1, tries do
+        local path = Path.current()
+        local fired = false
+        if path == "gui" then
+            fired = guiSwing()
+            S.clickPath = fired and "gui" or "gui (no Slash button)"
+        elseif path == "remote" then
+            local sent = remoteSwing(target)
+                    fired = sent > 0
+            S.clickPath = fired and "remote" or "remote (refused)"
+        elseif path == "mouse" then
+            fired = click()
+            S.clickPath = fired and (S.clickPath or "mouse") or "mouse (no input)"
+        end
+        if fired then
+            noteSwing(pullRan, healthBefore, path)
+            if cfg.tapSpace then keyTap(Enum.KeyCode.Space, 0.02) end
+            local watch = S.meter.watch
+            local deadline = clock() + 0.4
+            while clock() < deadline do
+                if HitSignal.check(watch) then break end
+                task.wait(0.03)
+            end
+            HitSignal.check(watch)
+            if watch and watch.hit then
+                confirmed, did = true, path
+                totalDamage = watch.damage or 0
+                if countStats then S.hits = (S.hits or 0) + 1 end
+                S.meter.damage = (S.meter.damage or 0) + totalDamage
+                S.meter.hits = (S.meter.hits or 0) + 1
+                S.swingsNoHit, S.watchdogStage, S.watchdogMsg = 0, 0, nil
+                S.meter.lastDamage = totalDamage
+                S.meter.lastSwingAfter = humanoid and humanoid.Health or S.meter.lastSwingAfter
+                if S.meter.current then
+                    S.meter.current.after = S.meter.lastSwingAfter
+                    S.meter.current.damage = totalDamage
+                    S.meter.current.signal = watch.signal
+                    S.meter.current.confirmed = true
+                end
+                if countStats then
+                    S.swings = (S.swings or 0) + 1
+                    Path.note(path, true)
+                end
+                break
+            end
+            if countStats then
+                S.swings = (S.swings or 0) + 1
+                Path.note(path, false)
+            end
+            did = did or path
+            if explicit then
+                S.clickPath = path .. " (no confirmed hit)"
+                break
+            end
+            if Path.locked then
+                -- A locked path gets one attempt per swing; retest at 50.
+                break
+            end
+            Path.advance()
+            if attempt < tries then task.wait(0.02) end
+        else
+            if Path.locked == path then Path.locked = nil end
+            if not explicit then Path.advance() end
+        end
+    end
+    -- One count per swing, not one per path attempt. Only a swing that actually
+    -- fired and could have hit counts, and the liveness checks are re-read now
+    -- because the ladder may have taken several attempts.
+    if countStats and did and not confirmed and Path.nohitEligible() then
+        S.swingsNoHit = (S.swingsNoHit or 0) + 1
+    end
+    return did, confirmed, totalDamage
+end
+
+local function watchdogTick()
+    local limit = math.max(5, tonumber(cfg.watchdogSwings) or 30)
+    if (S.swingsNoHit or 0) < limit then return end
+    S.swingsNoHit = 0
+    S.watchdogStage = (S.watchdogStage or 0) + 1
+    local stage = S.watchdogStage
+    if stage == 1 then
+        Pin.stop("watchdog: re-pin")
+        if S.target then S.target.nape = napeOf(S.target.model) end
+        S.watchdogMsg = "re-pin"
+    elseif stage == 2 then
+        if cfg.attackPath == "auto" then
+            Path.locked, Path.index = nil, 1
+            Path.advance()
+        end
+        S.watchdogMsg = "switch path to " .. tostring(Path.current())
+    elseif stage == 3 then
+        S.target = chooseTarget()
+        S.watchdogMsg = "switch target to " .. tostring(S.target and S.target.name or "none")
+    else
+        S.watchdogStage = 0
+        S.target = chooseTarget()
+        if S.target then
+            S.target.nape = napeOf(S.target.model)
+            Pin.stop("watchdog: re-target")
+            Pin.ensure(S.target)
+        end
+        S.watchdogMsg = "re-target/re-pin " .. tostring(S.target and S.target.name or "none")
+    end
+    say("watchdog: " .. tostring(S.watchdogMsg))
+end
+
+local function attackTick()
+    if not attackReady() then
+        if Pin.active then Pin.stop("pin: out of range") end
+        return
+    end
+    local now = clock()
+    if S.slashReleaseAt and now < S.slashReleaseAt then return end
+    if S.nextSlashAt and now < S.nextSlashAt then return end
+    if cfg.pinNape then
+        if not Pin.ensure(S.target) then
+            pcall(applyNapes)
+            task.wait()
+        end
+    else
+        if Pin.active then Pin.stop("pin off") end
+        pcall(applyNapes)
+        task.wait()
+    end
+    Path.retest()
+    executeSwing(true, S.pullRan == true)
+    watchdogTick()
+end
+
+local function fastTick(now)
+    if not S.running then return end
+    Refill.readBlades(localChar())
+    if S.owner ~= "refill" then
+        if S.reloading and Hover.base then
+            S.owner = "farm"
+            Hover.goal = Hover.base
+        else
+            S.owner = nil
+            Hover.goal = nil
+        end
+    end
+    if S.refillPauseUntil and now < S.refillPauseUntil then
+        if Refill.holding then refillKeyUp() end
+        releaseInput()
+        S.state = "manual control"
+        return
+    end
+    local _, root, humanoid = myChar()
+    if not root then
+        S.state = "no character"
+        S.target = nil
+        return
+    end
+    if humanoid and humanoid.Health <= 0 then
+        releaseInput()
+        if S.refilling then
+            refillKeyUp()
+            Refill.attempt = nil
+            S.refilling = false
+            setOwner(nil)
+            S.refillMsg = "refill cancelled - dead"
+        end
+        S.state = "dead - waiting for respawn"
+        S.target = nil
+        return
+    end
+    local kindNow = currentKind()
+    if kindNow ~= S.kindSeen then S.kindSeen, S.kindSince = kindNow, now end
+    if kindNow == "mission" and now - (S.kindSince or now) < 4 then
+        releaseInput()
+        S.state = "mission entry - holding still"
+        return
+    end
+    if S.results then
+        if S.refilling then refillCancel("refill cancelled - results screen") end
+        S.state = "results screen - waiting for retry"
+        return
+    end
+    if kindNow ~= "mission" and not workspace:FindFirstChild("Titans") then
+        if S.refilling then refillCancel("refill cancelled - lobby") end
+        releaseInput()
+        S.target = nil
+        S.state = "lobby - waiting for a round"
+        return
+    end
+    if kindNow == "mission" and (S.alive or 0) == 0 and not S.refilling then
+        releaseInput()
+        S.target = nil
+        S.state = S.emptySince
+            and ("mission - no titans for " .. math.floor(now - S.emptySince) .. "s")
+            or "mission - waiting for titans"
+        return
+    end
+    if S.reloading or S.refilling or now >= (S.nextRefillCheck or 0) then
+        S.nextRefillCheck = now + ((S.reloading or S.refilling) and 0.1 or 0.25)
+        if refillTick(now, root) then return end
+    end
+
+    local target = S.target
+    if target and dead(target.model) then
+        S.target = nil
+        target = nil
+    end
+    if not target then
+        S.target = chooseTarget()
+        target = S.target
+    end
+    if not target then
+        releaseInput()
+        S.state = "no titans in range"
+        return
+    end
+
+    local hrp = target.model:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        S.target = nil
+        return
+    end
+    local nape = target.nape
+    if not nape or not nape.Parent then
+        target.nape = napeOf(target.model)
+        nape = target.nape
+    end
+    if not nape then
+        S.state = "target has no nape"
+        return
+    end
+
+    local height = cfg.hover or 200
+    local _, titanType = pcall(function() return target.model:GetAttribute("Type") end)
+    if target.name == "Attack_Titan" or titanType == "Attack" or titanType == "Colossal" then
+        height = height + 40
+    elseif titanType == "Stall" then
+        height = math.max(60, height - 20)
+    end
+    S.hoverNow = height
+
+    local titanPos = hrp.Position
+    hoverAt(root, titanPos, height)
+
+    local okPos, napePosition = pcall(function() return nape.Position end)
+    local okTitan, titanDistance = pcall(function() return (titanPos - root.Position).Magnitude end)
+    S.titanDist = okTitan and titanDistance or nil
+    S.dist = S.titanDist
+
+    local aimPoint = titanPos
+    if okPos and napePosition and (napePosition - root.Position).Magnitude >= 12 then
+        aimPoint = napePosition
+    end
+    if cfg.multiHit and (S.cluster or 0) >= cfg.multiMin then
+        local centre = clusterCentre(target.model)
+        if centre then aimPoint = centre end
+    end
+
+    S.aimTick = (S.aimTick or 0) + 1
+    if S.aimTick % 2 == 1 then
+        aimAt(root, currentCamera(), aimPoint)
+    end
+    S.state = "attacking " .. tostring(target.name)
+end
+
+local function slowTick(now)
+    if not cfg.napeEnabled then S.napeParts = 0 end
+    pruneNapes()
+
+    local stat = nil
+    pcall(function() stat = tonumber(lp:GetAttribute("Stat")) end)
+    if stat ~= nil and S.statSeen ~= nil and stat > S.statSeen then
+        S.kills = S.kills + (stat - S.statSeen)
+    end
+    S.statSeen = stat
+
+    S.gas = gasPercent()
+    refillCounts()
+
+    local folder = workspace:FindFirstChild("Titans")
+    local alive = 0
+    if folder then
+        for _, model in ipairs(folder:GetChildren()) do
+            if model:IsA("Model") and not dead(model) then alive = alive + 1 end
+        end
+    end
+    S.alive = alive
+    if alive == 0 then
+        if not S.emptySince then S.emptySince = now end
+    else
+        S.emptySince = nil
+    end
+
+    local okType, roundType = pcall(function() return workspace:GetAttribute("Type") end)
+    S.roundType = okType and roundType or nil
+
+    if not S.rateAt then S.rateAt, S.rateSwings = now, S.swings end
+    if now - S.rateAt >= 1 then
+        S.rate = (S.swings - S.rateSwings) / (now - S.rateAt)
+        S.rateAt, S.rateSwings = now, S.swings
+    end
+
+    retryTick(now)
+    refreshStatus()
+end
+
+local function startFarm()
+    if S.running then return true end
+    cfg.autoFarm = true
+    S.running = true
+    S.runId = (S.runId or 0) + 1
+    local runId = S.runId
+    S.err = nil
+    S.results = false
+    S.refilling, S.reloading = false, false
+    Retry.tries, Retry.last, Retry.method, Retry.active = 0, nil, 0, false
+    S.retries = 0
+    Retry.lastMethod, Retry.lastResult, Retry.lastLabel = nil, nil, nil
+    Refill.tries, Refill.nextPress, Refill.until_ = 0, 0, 0
+    Refill.reloadStarted, Refill.reloadNextPress, Refill.reloadTries = 0, 0, 0
+    Refill.settleUntil, Refill.lastSets, Refill.lastDurability = 0, nil, nil
+    Refill.attempt = nil
+    Refill.cycles = 0
+    Refill.attempts, Refill.failures = 0, 0
+    Refill.holding, Refill.holdUntil, Refill.nextTry = false, 0, 0
+    Refill.stationScan, Refill.maxSets = 0, 3
+    Refill.lastMethod, Refill.lastHold = "-", 0
+    Refill.decision, Refill.why = "idle", "not checked"
+    S.statSeen = nil
+    S.pulls, S.napeParts, S.pullSlash, S.titanDist, S.hoverNow = 0, 0, 0, nil, nil
+    S.drift, S.lastDrift, S.jointsOff, S.jointsOn = 0, 0, 0, 0
+    S.pullMethod, S.pullMsg, S.pullRan = "off", nil, false
+    S.nextSlashAt, S.slashReleaseAt = nil, nil
+    S.pullStrikes, S.pullBlockedUntil = 0, nil
+    Pin.stop(nil)
+    Path.reset()
+    S.pinActive, S.pinMsg, S.pinDrift = false, nil, 0
+    S.swingsNoHit, S.watchdogStage, S.watchdogMsg = 0, 0, nil
+    meterReset()
+    S.owner, S.swingBoostUntil, S.swingVel = nil, nil, nil
+    S.refillReason, S.refillMsg, S.refillPauseUntil = nil, nil, nil
+    S.durability, S.durabilityX, S.durabilityY, S.durabilitySource = nil, nil, nil, nil
+    S.refills, S.refillsAttr, S.refillsText = nil, nil, nil
+    S.bladesBroken = false
+    S.emptySince = nil
+    S.resultsAt, S.resultsAtText = nil, nil
+    S.gameExitAt, S.gameExitText = nil, nil
+    S.nextRefillCheck = nil
+    S.startedAt = clock()
+    S.kindSeen = currentKind()
+    S.kindSince = -1000
+    pcall(function() S.statSeen = tonumber(lp:GetAttribute("Stat")) end)
+    pcall(function()
+        S.target = chooseTarget()
+    end)
+    pcall(fastTick, clock())
+
+    safeSpawn(function()
+        while S.running and S.runId == runId do
+            local ok, err = pcall(fastTick, clock())
+            if not ok then setError("fastTick", err) end
+            task.wait(cfg.tick)
+        end
+    end)
+    safeSpawn(function()
+        while S.running and S.runId == runId do
+            local ok, err = pcall(attackTick)
+            if not ok then setError("attackTick", err) end
+            task.wait(1 / math.max(1, cfg.attackHz))
+        end
+    end)
+    safeSpawn(function()
+        while S.running and S.runId == runId do
+            local ok, err = pcall(meterTick)
+            if not ok then setError("meterTick", err) end
+            task.wait(0.05)
+        end
+    end)
+    safeSpawn(function()
+        while S.running and S.runId == runId do
+            local ok, err = pcall(slowTick, clock())
+            if not ok then setError("slowTick", err) end
+            task.wait(0.25)
+        end
+    end)
+    say("started")
+    refreshControls()
+    return true
+end
+
+local function stopFarm()
+    if not S.running then return false end
+    S.running = false
+    cfg.autoFarm = false
+    S.runId = (S.runId or 0) + 1
+    S.target = nil
+    refillKeyUp()
+    S.refilling, S.reloading = false, false
+    Refill.attempt = nil
+    Refill.settleUntil = 0
+    S.dist = nil
+    S.state = "stopped"
+    S.pullMethod, S.pullMsg, S.pullRan = "off", "farm stopped", false
+    if SwingNet.open then
+        SwingNet.open = false
+        post("Attacks", "Slash", false)
+    end
+    Pin.stop("farm stopped")
+    restoreNapes()
+    hoverStop()
+    S.swingBoostUntil = nil
+    S.owner = nil
+    releaseInput()
+    say("stopped")
+    refreshControls()
+    return true
+end
+
+--============================================================================
+--  STATUS
+--============================================================================
+local function statusText()
+    local lines = {}
+    local function add(label, fn)
+        local ok, value = pcall(fn)
+        if ok then
+            if value ~= nil then lines[#lines + 1] = tostring(value) end
+        else
+            lines[#lines + 1] = label .. ": unavailable"
+        end
+    end
+
+    add("state", function()
+        return (S.running and "RUNNING" or "STOPPED") .. "   " .. tostring(S.state or "idle")
+    end)
+    add("place", function()
+        return "place: " .. currentKind() .. "   round: " .. tostring(S.roundType or "-")
+    end)
+    add("target", function()
+        local target = S.target
+        return "target: " .. (target and tostring(target.name) or "none")
+            .. "   dist: " .. (S.dist and string.format("%.0f", S.dist) or "-")
+    end)
+    add("kills", function()
+        return string.format("kills: %d   slashes: %d   hits(confirmed): %d   pulls: %d   %.1f k/min",
+            S.kills or 0, S.swings or 0, S.hits or 0, S.pulls or 0,
+            (S.kills or 0) / math.max(1, (clock() - (S.startedAt or clock())) / 60))
+    end)
+    add("damage", function()
+        local M = S.meter or {}
+        return string.format("damage: %.1f total   %.2f/swing   last hit: %.1f   speed@swing: %.0f",
+            M.damage or 0, (M.damage or 0) / math.max(1, M.swings or 0),
+            M.lastDamage or 0, M.lastSpeed or 0)
+    end)
+    add("drift", function()
+        return string.format("drift: max %.1f last %.1f   joints: %d off / %d on   method: %s",
+            S.drift or 0, S.lastDrift or 0, S.jointsOff or 0, S.jointsOn or 0,
+            tostring(S.pullMethod or "-"))
+    end)
+    add("alive", function()
+        return string.format("alive: %s   gas: %s   sets: %s   blades: %s   rate: %.1f/s",
+            tostring(S.alive or "-"), S.gas and (tostring(S.gas) .. "%") or "-",
+            tostring(S.refills or "-"), S.bladesBroken and "broken" or "ok", S.rate or 0)
+    end)
+    add("durability", function()
+        return string.format("durability: X=%s Y=%s -> %s (%s)   HUD sets \"%s\" (%s) attr %s",
+            S.durabilityX ~= nil and string.format("%.3f", S.durabilityX) or "-",
+            S.durabilityY ~= nil and string.format("%.3f", S.durabilityY) or "-",
+            S.durability ~= nil and string.format("%.3f", S.durability) or "-",
+            tostring(S.durabilitySource or "-"), tostring(S.refillsText or "-"),
+            S.refills ~= nil and tostring(S.refills) or "-",
+            S.refillsAttr ~= nil and tostring(S.refillsAttr) or "-")
+    end)
+    add("refill-decision", function()
+        return "refill decision: " .. tostring(Refill.decision or "idle")
+            .. "   why: " .. tostring(Refill.why or "-")
+    end)
+    add("pull", function()
+        return "pull: " .. tostring(S.pullMethod or "off")
+            .. "   ran: " .. tostring(S.pullRan == true)
+            .. "   mode: " .. tostring(cfg.pullDetach)
+            .. "   wait: " .. tostring(cfg.pullWait)
+            .. "   noCollide: " .. tostring(cfg.pullNoCollide == true)
+            .. "   why: " .. tostring(S.pullMsg or "-")
+    end)
+    add("path", function()
+        return "path: locked=" .. tostring(Path.locked or "none")
+            .. "   " .. Path.summary()
+            .. (Path.msg and ("   " .. tostring(Path.msg)) or "")
+    end)
+    add("pin", function()
+        return string.format("pin: %s   drift %.1f studs   msg: %s",
+            Pin.active and "ON" or "OFF", S.pinDrift or 0, tostring(S.pinMsg or "-"))
+    end)
+    add("hit-signal", function()
+        return "hit signal: " .. tostring(cfg.hitSignal or "auto")
+            .. "   watchdog: " .. tostring(S.watchdogMsg or "ok")
+            .. string.format("   no-hit swings: %d/%d", S.swingsNoHit or 0, cfg.watchdogSwings or 30)
+    end)
+    add("retries", function()
+        if S.retries and S.retries > 0 then return "retries: " .. tostring(S.retries) end
+        return nil
+    end)
+    add("refill", function()
+        if not (S.refillMsg or S.refilling or S.reloading) then return nil end
+        return string.format(
+            "refill: %s   try %d   method %s   hold %.1fs   sets %s/%s   dur %s",
+            tostring(S.refillMsg or Refill.decision or "-"), Refill.attempts or 0,
+            tostring(Refill.lastMethod or "-"), Refill.lastHold or 0,
+            tostring(S.refills or "-"), tostring(Refill.maxSets or 3),
+            S.durability and string.format("%.2f", S.durability) or "-")
+    end)
+    add("auto", function() return AutoExec.describe() end)
+    add("autostart", function() return "autostart: " .. BOOT.describe() end)
+    add("auto-note", function()
+        if S.autoMsg then return "auto note: " .. tostring(S.autoMsg) end
+        return nil
+    end)
+    lines[#lines + 1] = "error: " .. tostring(S.err or BOOT.lastError or "none")
+    lines[#lines + 1] = "last exit: " .. tostring(S.lastExit or "none")
+    return table.concat(lines, "\n")
+end
+
+
+refreshStatus = function()
+    local ok, text = pcall(statusText)
+    if not ok then
+        setError("statusText", text)
+        text = "panel error: " .. tostring(text)
+            .. "\nauto: unavailable\nautostart: unavailable\nerror: " .. tostring(text)
+    end
+    pcall(function()
+        if UI.status and UI.status.Parent then UI.status.Text = text end
+    end)
+end
+
+--============================================================================
+--  PANEL
+--============================================================================
+local ACCENT = Color3.fromRGB(124, 92, 220)
+local IDLE = Color3.fromRGB(58, 44, 88)
+local savePending = false
+
+local function scheduleSave()
+    if savePending then return end
+    savePending = true
+    task.delay(1, function()
+        savePending = false
+        saveCfg()
+    end)
+end
+
+local AOTR = { version = VERSION, _token = ACTIVE_TOKEN, _job = SERVER_KEY }
+
+local function buildUI()
+    local holder = (caps.gethui and probe(gethui)) or getPlayerGui()
+    if not holder then
+        say("no GUI holder - panel not created (API still works)")
+        setError("buildUI", "no GUI holder")
+        return false
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AOTR_Internal"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 999
+    gui.Parent = holder
+    UI.gui = gui
+
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.fromOffset(360, 500)
+    main.Position = UDim2.fromOffset(14, 64)
+    main.BackgroundColor3 = Color3.fromRGB(17, 13, 26)
+    main.BorderSizePixel = 0
+    main.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = main
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(72, 54, 118)
+    stroke.Thickness = 1
+    stroke.Parent = main
+
+    local header = Instance.new("Frame")
+    header.Name = "Header"
+    header.Size = UDim2.new(1, 0, 0, 30)
+    header.BackgroundColor3 = Color3.fromRGB(26, 20, 40)
+    header.BorderSizePixel = 0
+    header.Active = true
+    header.Parent = main
+    local headerCorner = Instance.new("UICorner")
+    headerCorner.CornerRadius = UDim.new(0, 8)
+    headerCorner.Parent = header
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -30, 1, 0)
+    title.Position = UDim2.fromOffset(10, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "AOTR internal  v" .. VERSION
+    title.TextColor3 = Color3.fromRGB(226, 218, 255)
+    title.Font = Enum.Font.GothamMedium
+    title.TextSize = 13
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = header
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.fromOffset(24, 22)
+    close.Position = UDim2.new(1, -28, 0, 4)
+    close.BackgroundTransparency = 1
+    close.Text = "x"
+    close.TextColor3 = Color3.fromRGB(180, 160, 220)
+    close.Font = Enum.Font.Gotham
+    close.TextSize = 14
+    close.Parent = header
+    close.MouseButton1Click:Connect(safe(function() main.Visible = false end, "connect"))
+
+    local body = Instance.new("ScrollingFrame")
+    body.Name = "Body"
+    body.Size = UDim2.new(1, -12, 1, -38)
+    body.Position = UDim2.fromOffset(6, 34)
+    body.BackgroundTransparency = 1
+    body.BorderSizePixel = 0
+    body.ScrollBarThickness = 3
+    body.ScrollBarImageColor3 = Color3.fromRGB(90, 70, 140)
+    body.CanvasSize = UDim2.new(0, 0, 0, 0)
+    body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    body.Parent = main
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 4)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = body
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 2)
+    padding.PaddingBottom = UDim.new(0, 8)
+    padding.PaddingLeft = UDim.new(0, 2)
+    padding.PaddingRight = UDim.new(0, 2)
+    padding.Parent = body
+
+    local order = 0
+    local function nextOrder()
+        order = order + 1
+        return order
+    end
+
+    local function addLabel(parent, text, height)
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, 0, 0, height or 16)
+        label.BackgroundTransparency = 1
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(150, 134, 186)
+        label.Font = Enum.Font.Gotham
+        label.TextSize = 11
+        label.TextWrapped = true
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.LayoutOrder = nextOrder()
+        label.Parent = parent
+        return label
+    end
+
+    local function addButton(parent, text, onClick, height)
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(1, 0, 0, height or 26)
+        button.BackgroundColor3 = IDLE
+        button.BorderSizePixel = 0
+        button.Text = text
+        button.TextColor3 = Color3.fromRGB(232, 226, 255)
+        button.Font = Enum.Font.GothamMedium
+        button.TextSize = 12
+        button.LayoutOrder = nextOrder()
+        button.Parent = parent
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 4)
+        c.Parent = button
+        button.MouseButton1Click:Connect(safe(function()
+            local ok, err = pcall(onClick, button)
+            if not ok then say("button '" .. text .. "' failed: " .. tostring(err)) end
+        end, "connect"))
+        return button
+    end
+
+    local function addToggle(parent, label, key, after)
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(1, 0, 0, 26)
+        button.BorderSizePixel = 0
+        button.Font = Enum.Font.GothamMedium
+        button.TextSize = 12
+        button.TextColor3 = Color3.fromRGB(232, 226, 255)
+        button.LayoutOrder = nextOrder()
+        button.Parent = parent
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 4)
+        c.Parent = button
+
+        local function update()
+            button.Text = label .. "   [" .. (cfg[key] and "ON" or "OFF") .. "]"
+            button.BackgroundColor3 = cfg[key] and ACCENT or IDLE
+        end
+        update()
+        button.MouseButton1Click:Connect(safe(function()
+            cfg[key] = not cfg[key]
+            update()
+            scheduleSave()
+            if after then
+                local ok, err = pcall(after, cfg[key])
+                if not ok then say(label .. ": " .. tostring(err)) end
+            end
+        end, "connect"))
+        UI.controls[#UI.controls + 1] = update
+        return button, update
+    end
+
+    local function addSlider(parent, label, key, minimum, maximum, step)
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 0, 30)
+        frame.BackgroundColor3 = Color3.fromRGB(24, 19, 36)
+        frame.BorderSizePixel = 0
+        frame.LayoutOrder = nextOrder()
+        frame.Parent = parent
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 4)
+        c.Parent = frame
+
+        local name = Instance.new("TextLabel")
+        name.Size = UDim2.new(1, -96, 1, 0)
+        name.Position = UDim2.fromOffset(8, 0)
+        name.BackgroundTransparency = 1
+        name.TextColor3 = Color3.fromRGB(214, 205, 240)
+        name.Font = Enum.Font.Gotham
+        name.TextSize = 11
+        name.TextXAlignment = Enum.TextXAlignment.Left
+        name.Parent = frame
+
+        local value = Instance.new("TextLabel")
+        value.Size = UDim2.fromOffset(44, 20)
+        value.Position = UDim2.new(1, -92, 0, 5)
+        value.BackgroundTransparency = 1
+        value.TextColor3 = Color3.fromRGB(182, 158, 255)
+        value.Font = Enum.Font.GothamMedium
+        value.TextSize = 11
+        value.Parent = frame
+
+        local function bump(direction)
+            local current = tonumber(cfg[key]) or minimum
+            local nextValue = current + direction * step
+            if nextValue < minimum then nextValue = minimum end
+            if nextValue > maximum then nextValue = maximum end
+            cfg[key] = nextValue
+            scheduleSave()
+            name.Text = label
+            value.Text = tostring(cfg[key])
+        end
+
+        local minus = Instance.new("TextButton")
+        minus.Size = UDim2.fromOffset(20, 20)
+        minus.Position = UDim2.new(1, -46, 0, 5)
+        minus.BackgroundColor3 = IDLE
+        minus.BorderSizePixel = 0
+        minus.Text = "-"
+        minus.TextColor3 = Color3.fromRGB(232, 226, 255)
+        minus.Font = Enum.Font.GothamBold
+        minus.TextSize = 12
+        minus.Parent = frame
+        minus.MouseButton1Click:Connect(safe(function() bump(-1) end, "connect"))
+
+        local plus = Instance.new("TextButton")
+        plus.Size = UDim2.fromOffset(20, 20)
+        plus.Position = UDim2.new(1, -24, 0, 5)
+        plus.BackgroundColor3 = IDLE
+        plus.BorderSizePixel = 0
+        plus.Text = "+"
+        plus.TextColor3 = Color3.fromRGB(232, 226, 255)
+        plus.Font = Enum.Font.GothamBold
+        plus.TextSize = 12
+        plus.Parent = frame
+        plus.MouseButton1Click:Connect(safe(function() bump(1) end, "connect"))
+
+        local function update()
+            name.Text = label
+            value.Text = tostring(cfg[key])
+        end
+        update()
+        UI.controls[#UI.controls + 1] = update
+        return frame
+    end
+
+    addToggle(body, "Auto farm", "autoFarm", function(value)
+        if value then startFarm() else stopFarm() end
+        saveCfg(true)
+    end)
+    addLabel(body, "P starts/stops. RightControl hides this panel.")
+    addToggle(body, "Pin nape", "pinNape")
+    addButton(body, "Attack path: " .. tostring(cfg.attackPath), function(button)
+        local paths = { "auto", "gui", "remote", "mouse" }
+        local current = 1
+        for index, value in ipairs(paths) do
+            if value == cfg.attackPath then current = index break end
+        end
+        cfg.attackPath = paths[(current % #paths) + 1]
+        button.Text = "Attack path: " .. cfg.attackPath
+        saveCfg()
+    end)
+    addSlider(body, "Hover height", "hover", 40, 300, 5)
+    addSlider(body, "Attack rate", "attackHz", 1, 40, 1)
+    addToggle(body, "Auto reload", "autoReload")
+    addToggle(body, "Auto refill", "refill")
+    addToggle(body, "Auto retry", "autoRetry")
+    addToggle(body, "Auto execute", "autoExecute", function()
+        -- Save now, not on the 1 s debounce: the loader and the queued copy
+        -- both read autoExecute from this file.
+        saveCfg()
+        AutoExec.refresh()
+    end)
+    addButton(body, "Test auto execute", function()
+        AutoExec.test()
+        refreshStatus()
+    end)
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, 0, 0, 250)
+    status.BackgroundColor3 = Color3.fromRGB(13, 10, 20)
+    status.BorderSizePixel = 0
+    status.Text = statusText()
+    status.TextColor3 = Color3.fromRGB(206, 198, 236)
+    status.Font = Enum.Font.Code
+    status.TextSize = 10
+    status.TextWrapped = true
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.TextYAlignment = Enum.TextYAlignment.Top
+    status.LayoutOrder = nextOrder()
+    status.Parent = body
+    UI.status = status
+
+    header.InputBegan:Connect(safe(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            UI.dragging = true
+        end
+    end, "connect"))
+    UserInput.InputEnded:Connect(safe(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            UI.dragging = false
+        end
+    end, "connect"))
+    UserInput.InputChanged:Connect(safe(function(input)
+        if UI.dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Delta
+            main.Position = UDim2.fromOffset(
+                math.max(0, main.AbsolutePosition.X + delta.X),
+                math.max(0, main.AbsolutePosition.Y + delta.Y))
+        end
+    end, "connect"))
+
+    UserInput.InputBegan:Connect(safe(function(input, processed)
+        if processed then return end
+        if input.KeyCode == Enum.KeyCode.RightControl then
+            main.Visible = not main.Visible
+        end
+    end, "connect"))
+end
+
+refreshControls = function()
+    for _, update in ipairs(UI.controls) do pcall(update) end
+end
+
+function AOTR.status() return statusText() end
+function AOTR.save() return saveCfg() end
+function AOTR.start() return startFarm() end
+function AOTR.stop() return stopFarm() end
+function AOTR.toggle() if S.running then return stopFarm() end return startFarm() end
+function AOTR.copyFlight(count) return Exit.copyFlight(count) end
+function AOTR.restore() return restoreNapes() end
+function AOTR.destroy()
+    stopFarm()
+    if genv.AOTR_hotkey then
+        pcall(function() genv.AOTR_hotkey:Disconnect() end)
+        genv.AOTR_hotkey = nil
+    end
+    if UI.gui then UI.gui:Destroy() end
+    pcall(Exit.stop)
+    clearActive()
+    if genv.AOTR == AOTR then genv.AOTR = nil end
+end
+
+local function toggleFarm()
+    if S.running then stopFarm() else startFarm() end
+    saveCfg(true)
+    refreshControls()
+    say("P: farm " .. (S.running and "on" or "off"))
+end
+
+pcall(function()
+    genv.AOTR_hotkey = UserInput.InputBegan:Connect(safe(function(input)
+        if input.KeyCode ~= Enum.KeyCode.P then return end
+        local box = nil
+        pcall(function() box = UserInput:GetFocusedTextBox() end)
+        if box then return end
+        toggleFarm()
+    end, "connect"))
+end)
+
+genv.AOTR = AOTR
+local built, buildErr = pcall(buildUI)
+if not built then setError("buildUI", buildErr) end
+-- Capture the exact running source before the panel and refresh report it.
+pcall(AutoExec.checkSource, true)
+if AutoExec.sourceOk then pcall(AutoExec.ensureSaved) end
+pcall(AutoExec.refresh)
+refreshControls()
+refreshStatus()
+pcall(Exit.start)
+safeSpawn(function()
+    while true do
+        task.wait(1)
+        local ok, err = pcall(refreshStatus)
+        if not ok then setError("panel timer", err) end
+    end
+end, "panel timer")
+
+safeSpawn(function()
+    if cfg.autoFarm ~= true then
+        BOOT.stage = "auto farm OFF"
+        BOOT.failed = nil
+        return
+    end
+    BOOT.stage = "Interface"
+    local deadline = clock() + 30
+    local ready = false
+    while clock() < deadline do
+        local playerGui = getPlayerGui()
+        local char = localChar()
+        local humanoid = nil
+        if char then
+            pcall(function() humanoid = char:FindFirstChildOfClass("Humanoid") end)
+        end
+        local loaded = false
+        pcall(function() loaded = game:IsLoaded() end)
+        if loaded and humanoid and playerGui
+            and playerGui:FindFirstChild("Interface") then
+            ready = true
+            BOOT.ready = true
+            BOOT.failed = nil
+            break
+        end
+        task.wait(0.5)
+    end
+    if not ready then
+        BOOT.stage = "failed"
+        BOOT.failed = "game/Interface timeout"
+        writeLog("autostart: failed - game/Interface timeout")
+        return
+    end
+    if cfg.autoFarm ~= true or S.running then
+        if S.running then
+            BOOT.stage = "started"
+            BOOT.started = true
+            BOOT.elapsed = clock() - BOOT.startedAt
+        else
+            BOOT.stage = "auto farm OFF"
+            BOOT.failed = nil
+        end
+        return
+    end
+    BOOT.stage = "starting"
+    local ok, err = pcall(startFarm)
+    if not ok then
+        BOOT.stage = "failed"
+        BOOT.failed = "startFarm: " .. tostring(err)
+        setError("autostart", err)
+        return
+    end
+    if S.running ~= true then
+        BOOT.stage = "failed"
+        BOOT.failed = "startFarm did not start"
+        writeLog("autostart: failed - startFarm did not start")
+        return
+    end
+    S.kindSince = clock()
+    S.autoMsg = "auto started from saved setting"
+    BOOT.stage = "started"
+    BOOT.started = true
+    BOOT.elapsed = clock() - BOOT.startedAt
+    writeLog(string.format("autostart: started in %.1fs", BOOT.elapsed))
+end, "auto start")
+
+Net.bind()
+safeSpawn(function()
+    for _ = 1, 90 do
+        if Net.get and Net.post then return end
+        task.wait(2)
+        pcall(Net.bind)
+    end
+    say("remotes not found after 3 minutes - GUI fallbacks only")
+end)
+
+say("internal v" .. VERSION .. " loaded - RightControl hides the panel, P toggles the farm")
+say("remotes: GET=" .. tostring(Net.get ~= nil) .. " GET_2=" .. tostring(Net.get2 ~= nil)
+    .. " POST=" .. tostring(Net.post ~= nil))

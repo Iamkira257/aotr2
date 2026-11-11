@@ -8,12 +8,17 @@ local RunService   = game:GetService("RunService")
 local HttpService  = game:GetService("HttpService")
 local UserInput    = game:GetService("UserInputService")
 local Replicated   = game:GetService("ReplicatedStorage")
+-- Standalone internal execution does not get the wrapper's Net table. Keep a
+-- safe fallback so the loader cannot fail on Net.bind when no remotes exist.
+if type(Net) ~= "table" then Net = {} end
 
 local lp = nil
 local VERSION = "2.9"
 local BUILD = "2.9+autoexec.16"
 local CFG_FILE = "aotr_internal_cfg.json"
--- aotr_run.lua writes this exact copy; the autoexec loader runs it on relaunch.
+-- Autoexecute loads this remote script on reinject and after a teleport.
+local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/Iamkira257/aotr2/refs/heads/main/script"
+-- Kept for the manual runner fallback; autoexecute no longer depends on it.
 local SOURCE_FILE = "aotr_internal_src.lua"
 local LOG_FILE = "aotr_autoexec_log.txt"
 local RUN_FILE = "aotr_run.lua"
@@ -456,6 +461,11 @@ local function isMainSource(value)
         and value:find("local function buildQueueText", 1, true) ~= nil
 end
 
+local function isCurrentBuild(value)
+    return type(value) == "string"
+        and value:find('local BUILD = "' .. BUILD .. '"', 1, true) ~= nil
+end
+
 function AutoExec.checkSource(force)
     if AutoExec.sourceText and not force then return true end
     if AutoExec.captured and not force then return AutoExec.sourceOk == true end
@@ -467,23 +477,41 @@ function AutoExec.checkSource(force)
     local env = nil
     pcall(function() env = getgenv() end)
     local carried = type(env) == "table" and env.AOTR_SOURCE or nil
-    if isMainSource(carried) then
-        AutoExec.sourceText = carried
-        AutoExec.sourceMethod = tostring(env.AOTR_SOURCE_METHOD or "aotr_run.lua")
-    else
-        local info = nil
-        pcall(function() info = debug.getinfo(1, "S") end)
-        local dbg = info and info.source or nil
-        if isMainSource(dbg) then
-            AutoExec.sourceText = dbg
-            AutoExec.sourceMethod = "debug.getinfo"
-        elseif caps.getclipboard then
-            local ok, clip = pcall(getclipboard)
-            if ok and isMainSource(clip) then
-                AutoExec.sourceText = clip
-                AutoExec.sourceMethod = "clipboard"
+    -- Prefer the chunk that is running now and the current BUILD. A previous
+    -- loader can leave an older AOTR_SOURCE in memory; using it silently queues
+    -- the old build. Keep an old main source as a last-resort fallback so an
+    -- executor without debug source does not lose autoexecute entirely.
+    local info = nil
+    pcall(function() info = debug.getinfo(1, "S") end)
+    local dbg = info and info.source or nil
+    local clip = nil
+    if caps.getclipboard then
+        local ok, value = pcall(getclipboard)
+        if ok then clip = value end
+    end
+    local candidates = {
+        { value = dbg, method = "debug.getinfo" },
+        { value = carried, method = tostring(env and env.AOTR_SOURCE_METHOD or "aotr_run.lua") },
+        { value = clip, method = "clipboard" },
+    }
+    local chosen = nil
+    for _, entry in ipairs(candidates) do
+        if isMainSource(entry.value) and isCurrentBuild(entry.value) then
+            chosen = entry
+            break
+        end
+    end
+    if not chosen then
+        for _, entry in ipairs(candidates) do
+            if isMainSource(entry.value) then
+                chosen = entry
+                break
             end
         end
+    end
+    if chosen then
+        AutoExec.sourceText = chosen.value
+        AutoExec.sourceMethod = chosen.method
     end
 
     if AutoExec.sourceText then
@@ -554,31 +582,15 @@ function AutoExec.ensureSaved()
     return ok, why
 end
 
--- Build the exact chunk passed to queue_on_teleport. The source sits in one
--- long string, so the queued run gets the same text and the same source method.
+-- Build the exact chunk passed to queue_on_teleport. Autoexecute always runs
+-- the remote script through the URL below instead of a saved local copy.
 local function buildQueueText()
-    local source = AutoExec.sourceText
-    if type(source) ~= "string" or source == "" then return nil, "no source" end
-    local body = source
-    if body:sub(-1) ~= "\n" then body = body .. "\n" end
-    local equals = 3
-    while body:find("]" .. string.rep("=", equals) .. "]", 1, true) do
-        equals = equals + 1
-    end
-    local open = "[" .. string.rep("=", equals) .. "["
-    local close = "]" .. string.rep("=", equals) .. "]"
     local text = table.concat({
         "-- AOTR_QUEUE_WRAPPER",
         "local AOTR_QUEUE_LOG = " .. string.format("%q", LOG_FILE),
-        "local AOTR_QUEUE_SOURCE = " .. open,
-        body .. close,
         "local ok, err = pcall(function()",
-        "    getgenv().AOTR_SOURCE = AOTR_QUEUE_SOURCE",
-        "    getgenv().AOTR_SOURCE_METHOD = 'queued'",
         "    getgenv().AOTR_QUEUED_RUN = true",
-        "    local fn, compileErr = loadstring(AOTR_QUEUE_SOURCE)",
-        "    if not fn then error(compileErr) end",
-        "    return fn()",
+        "    return loadstring(game:HttpGet(" .. string.format("%q", REMOTE_SCRIPT_URL) .. "))()",
         "end)",
         "if not ok then",
         "    pcall(function()",
@@ -596,26 +608,9 @@ function AutoExec.compile(force)
         return AutoExec.compileOk, AutoExec.compileErr
     end
     AutoExec.compileOk, AutoExec.compileErr, AutoExec.queueBytes = nil, nil, nil
-    local source = AutoExec.sourceText
-    if type(source) ~= "string" then
-        AutoExec.compileOk = false
-        AutoExec.compileErr = "no source"
-        return false, AutoExec.compileErr
-    end
     if type(loadstring) ~= "function" then
         AutoExec.compileOk = false
         AutoExec.compileErr = "no compiler in this executor"
-        return false, AutoExec.compileErr
-    end
-    local okSrc, fnSrc, errSrc = pcall(loadstring, source)
-    if not okSrc then
-        AutoExec.compileOk = false
-        AutoExec.compileErr = tostring(fnSrc)
-        return false, AutoExec.compileErr
-    end
-    if not fnSrc then
-        AutoExec.compileOk = false
-        AutoExec.compileErr = tostring(errSrc)
         return false, AutoExec.compileErr
     end
     local queueText, why = buildQueueText()
@@ -642,8 +637,6 @@ function AutoExec.compile(force)
 end
 
 function AutoExec.test()
-    AutoExec.checkSource(true)
-    if AutoExec.sourceOk then pcall(AutoExec.ensureSaved) end
     local fn, name = queueFn()
     AutoExec.queueName = name
     local savedFlag = readSavedFlag("autoExecute")
@@ -651,18 +644,8 @@ function AutoExec.test()
     AutoExec.savedAt = os.clock()
     local compiled, compileWhy = AutoExec.compile(true)
 
-    local sourceText
-    if AutoExec.sourceOk then
-        sourceText = string.format("%s %d B",
-            tostring(AutoExec.sourceMethod or "source"), AutoExec.sourceBytes or 0)
-    else
-        sourceText = "none"
-    end
-
     local plan
-    if not AutoExec.sourceOk then
-        plan = "no source - " .. sourceHint()
-    elseif not name then
+    if not name then
         plan = "no queue_on_teleport in this executor"
     elseif not compiled then
         plan = "compile failed"
@@ -674,8 +657,8 @@ function AutoExec.test()
         plan = "would queue; new server runs, same server exits duplicate"
     end
 
-    AutoExec.testText = string.format("test: src %s | %s | saved %s | queue %s | %s",
-        sourceText,
+    AutoExec.testText = string.format("test: remote %s | %s | saved %s | queue %s | %s",
+        REMOTE_SCRIPT_URL,
         compiled and "compiles OK" or ("compile error: " .. tostring(compileWhy)),
         savedFlag == nil and "?" or (savedFlag and "ON" or "OFF"),
         tostring(name or "none"),
@@ -685,7 +668,6 @@ function AutoExec.test()
 end
 
 function AutoExec.refresh()
-    AutoExec.checkSource()
     AutoExec.checkedAt = os.clock()
     local fn, name = queueFn()
     AutoExec.queueName = name
@@ -699,11 +681,6 @@ function AutoExec.refresh()
     end
     if not fn then
         AutoExec.reason = "no queue_on_teleport in this executor"
-        autoLog("queue failed: " .. AutoExec.reason)
-        return false
-    end
-    if not AutoExec.sourceOk then
-        AutoExec.reason = "source not found - " .. sourceHint()
         autoLog("queue failed: " .. AutoExec.reason)
         return false
     end
@@ -732,35 +709,24 @@ function AutoExec.refresh()
     AutoExec.queueCount = AutoExec.queueCount + 1
     AutoExec.lastAt = os.date("%H:%M:%S")
     AutoExec.reason = nil
-    autoLog(string.format("queued x%d for job=%s via %s, src %s %d B, queue %d B",
-        AutoExec.queueCount, key, tostring(name), tostring(AutoExec.sourceMethod or "?"),
-        AutoExec.sourceBytes or 0, AutoExec.queueBytes or 0))
+    autoLog(string.format("queued x%d for job=%s via %s, remote %s, queue %d B",
+        AutoExec.queueCount, key, tostring(name), REMOTE_SCRIPT_URL,
+        AutoExec.queueBytes or 0))
     return true
 end
 
 function AutoExec.describe()
     local now = os.clock()
-    if not AutoExec.checkedAt or now - AutoExec.checkedAt > 5 then
-        AutoExec.checkSource()
-        AutoExec.checkedAt = now
-    end
     if not AutoExec.savedAt or now - AutoExec.savedAt > 2 then
         local savedFlag = readSavedFlag("autoExecute")
         if savedFlag == nil then AutoExec.savedOn = nil else AutoExec.savedOn = savedFlag == true end
         AutoExec.savedAt = now
     end
-    local sourceText
-    if AutoExec.sourceOk then
-        sourceText = string.format("%s %d B",
-            tostring(AutoExec.sourceMethod or "source"), AutoExec.sourceBytes or 0)
-    else
-        sourceText = "none - " .. sourceHint()
-    end
     local parts = {
         "auto: " .. (cfg.autoExecute == true and "ON" or "OFF"),
         "saved " .. (AutoExec.savedOn == nil and "?" or (AutoExec.savedOn and "ON" or "OFF")),
         "queue " .. tostring(AutoExec.queueName or "none"),
-        "src " .. sourceText,
+        "remote",
     }
     if AutoExec.compileOk == true then
         parts[#parts + 1] = "compiles OK"
@@ -2600,6 +2566,30 @@ local Refill = {
     holding = false, holdUntil = 0, nextTry = 0, stationScan = 0,
 }
 
+-- Count the actual blade parts. A set is only spent when all 14 parts have
+-- become transparent; this prevents an early reload at the 2% UI sliver.
+function Refill.bladeCounts(char)
+    local total, clear = 0, 0
+    local rig = char and char:FindFirstChild("Rig_" .. lp.Name)
+    local left = rig and rig:FindFirstChild("LeftHand")
+    local right = rig and rig:FindFirstChild("RightHand")
+    for _, hand in ipairs({ left, right }) do
+        if hand then
+            for index = 1, 7 do
+                local blade = hand:FindFirstChild("Blade_" .. index)
+                if blade then
+                    total = total + 1
+                    local ok, transparency = pcall(function() return blade.Transparency end)
+                    if ok and type(transparency) == "number" and transparency >= 0.95 then
+                        clear = clear + 1
+                    end
+                end
+            end
+        end
+    end
+    return total, clear
+end
+
 -- The HUD durability is the gradient on Blades.Inner.Bar. Empty is about 0,
 -- full is about 1.0; the old exact Transparency == 1 check missed settled blades.
 function Refill.readBlades(char)
@@ -2622,29 +2612,17 @@ function Refill.readBlades(char)
             S.durabilityX, S.durabilityY = x, okY and y or nil
             S.durabilitySource = "gradient"
             S.durability = x
-            S.bladesBroken = x <= 0.02
+            local total, clear = Refill.bladeCounts(char)
+            if total == 14 then
+                S.bladesBroken = clear == 14
+            else
+                S.bladesBroken = x <= 0.005
+            end
             return x
         end
     end
 
-    local total, clear = 0, 0
-    local rig = char and char:FindFirstChild("Rig_" .. lp.Name)
-    local left = rig and rig:FindFirstChild("LeftHand")
-    local right = rig and rig:FindFirstChild("RightHand")
-    for _, hand in ipairs({ left, right }) do
-        if hand then
-            for index = 1, 7 do
-                local blade = hand:FindFirstChild("Blade_" .. index)
-                if blade then
-                    total = total + 1
-                    local ok, transparency = pcall(function() return blade.Transparency end)
-                    if ok and type(transparency) == "number" and transparency >= 0.95 then
-                        clear = clear + 1
-                    end
-                end
-            end
-        end
-    end
+    local total, clear = Refill.bladeCounts(char)
     S.durabilityX, S.durabilityY = nil, nil
     if total == 0 then
         S.durabilitySource = "none"
@@ -4637,25 +4615,6 @@ local function buildUI()
         saveCfg(true)
     end)
     addLabel(body, "P starts/stops. RightControl hides this panel.")
-    addToggle(body, "Pin nape", "pinNape")
-    addSlider(body, "Speed cap", "speedCap", 200, 1500, 25)
-    addSlider(body, "Fall clamp", "fallLimit", 0, 100, 5)
-    addToggle(body, "Tap Space", "tapSpace")
-    addToggle(body, "Count registers", "countRegisters")
-    addToggle(body, "Fresh overlap", "freshOverlap")
-    addSlider(body, "Hold on player", "holdOnPlayer", 0.05, 0.40, 0.01)
-    addSlider(body, "Swing interval", "swingInterval", 0.12, 0.40, 0.01)
-
-    addButton(body, "Attack path: " .. tostring(cfg.attackPath), function(button)
-        local paths = { "auto", "gui", "remote", "mouse" }
-        local current = 1
-        for index, value in ipairs(paths) do
-            if value == cfg.attackPath then current = index break end
-        end
-        cfg.attackPath = paths[(current % #paths) + 1]
-        button.Text = "Attack path: " .. cfg.attackPath
-        saveCfg()
-    end)
     addSlider(body, "Hover height", "hover", 40, 300, 5)
     addSlider(body, "Attack rate", "attackHz", 1, 40, 1)
     addToggle(body, "Auto reload", "autoReload")
@@ -4760,9 +4719,7 @@ end)
 genv.AOTR = AOTR
 local built, buildErr = pcall(buildUI)
 if not built then setError("buildUI", buildErr) end
--- Capture the exact running source before the panel and refresh report it.
-pcall(AutoExec.checkSource, true)
-if AutoExec.sourceOk then pcall(AutoExec.ensureSaved) end
+-- Autoexecute pulls the remote script, so there is no local source to capture.
 pcall(AutoExec.refresh)
 refreshControls()
 refreshStatus()
@@ -4841,7 +4798,9 @@ safeSpawn(function()
     writeLog(string.format("autostart: started in %.1fs", BOOT.elapsed))
 end, "auto start")
 
-Net.bind()
+if type(Net) == "table" and type(Net.bind) == "function" then
+    pcall(Net.bind)
+end
 -- Assets can stream in after this script starts. Retry only the missing-POST
 -- case; an executor without hookmetamethod must not spin here.
 safeSpawn(function()
@@ -4855,13 +4814,16 @@ safeSpawn(function()
 end)
 safeSpawn(function()
     for _ = 1, 90 do
-        if Net.get and Net.post then return end
+        if type(Net) == "table" and Net.get and Net.post then return end
         task.wait(2)
-        pcall(Net.bind)
+        if type(Net) == "table" and type(Net.bind) == "function" then
+            pcall(Net.bind)
+        end
     end
     say("remotes not found after 3 minutes - GUI fallbacks only")
 end)
 
 say("internal v" .. VERSION .. " loaded - RightControl hides the panel, P toggles the farm")
-say("remotes: GET=" .. tostring(Net.get ~= nil) .. " GET_2=" .. tostring(Net.get2 ~= nil)
-    .. " POST=" .. tostring(Net.post ~= nil))
+say("remotes: GET=" .. tostring(type(Net) == "table" and Net.get ~= nil)
+    .. " GET_2=" .. tostring(type(Net) == "table" and Net.get2 ~= nil)
+    .. " POST=" .. tostring(type(Net) == "table" and Net.post ~= nil))

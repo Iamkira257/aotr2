@@ -8,20 +8,23 @@ local RunService   = game:GetService("RunService")
 local HttpService  = game:GetService("HttpService")
 local UserInput    = game:GetService("UserInputService")
 local Replicated   = game:GetService("ReplicatedStorage")
+local IS_MOBILE = false
+pcall(function()
+    IS_MOBILE = UserInput.TouchEnabled == true
+end)
 -- Standalone internal execution does not get the wrapper's Net table. Keep a
 -- safe fallback so the loader cannot fail on Net.bind when no remotes exist.
 if type(Net) ~= "table" then Net = {} end
 
 local lp = nil
-local VERSION = "2.9"
-local BUILD = "2.9+autoexec.18"
+local BUILD = "2.9+autoexec.45"
 local CFG_FILE = "aotr_internal_cfg.json"
 -- Autoexecute loads this remote script on reinject and after a teleport.
 local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/Iamkira257/aotr2/refs/heads/main/script"
 -- Kept for the manual runner fallback; autoexecute no longer depends on it.
 local SOURCE_FILE = "aotr_internal_src.lua"
 local LOG_FILE = "aotr_autoexec_log.txt"
-local RUN_FILE = "aotr_run.lua"
+
 
 local genv = getgenv()
 local S
@@ -162,8 +165,8 @@ end, "heartbeat")
 
 writeLog("boot " .. BUILD .. " waiting game")
 BOOT.stage = "game"
-local gameOk, gameDeadline = false, os.clock() + 30
-while os.clock() < gameDeadline do
+local gameOk = false
+for _ = 1, 120 do
     local ok, loaded = pcall(function() return game:IsLoaded() end)
     if ok and loaded then gameOk = true break end
     task.wait(0.25)
@@ -175,8 +178,8 @@ end
 
 BOOT.stage = "player"
 writeLog("boot waiting player")
-local player, playerDeadline = nil, os.clock() + 30
-while os.clock() < playerDeadline do
+local player = nil
+for _ = 1, 120 do
     local ok, found = pcall(function() return Players.LocalPlayer end)
     if ok and found then player = found break end
     task.wait(0.25)
@@ -233,22 +236,16 @@ end
 -- tree that may still be loading. They return nil instead of throwing.
 local function getPlayerGui()
     if not lp then return nil end
-    local ok, gui = pcall(function() return lp:FindFirstChild("PlayerGui") end)
-    if ok then return gui end
-    return nil
+    return lp:FindFirstChild("PlayerGui")
 end
 
 local function localChar()
     if not lp then return nil end
-    local ok, char = pcall(function() return lp.Character end)
-    if ok then return char end
-    return nil
+    return lp.Character
 end
 
 local function currentCamera()
-    local ok, camera = pcall(function() return workspace.CurrentCamera end)
-    if ok then return camera end
-    return nil
+    return workspace.CurrentCamera
 end
 
 local caps = {
@@ -276,6 +273,30 @@ if not caps.vim then caps.vim = false end
 
 local cfg = {
     autoFarm       = false,
+    autoSlot       = false,
+    autoMenu       = false,
+    autoStartMissions = false,
+    disable3D      = false,
+    performance    = false,
+    removeFog      = false,
+    missionMap     = "Forest",
+    missionObjective = "Random",
+    modNoPerks       = false,
+    modNoSkills      = false,
+    modNoMemories    = false,
+    modNightmare     = false,
+    modOddball       = false,
+    modInjuryProne   = false,
+    modChronicInjuries = false,
+    modFog           = false,
+    modGlassCannon   = false,
+    modTimeTrial     = false,
+    modFatigue       = false,
+    modEvolution     = false,
+    modBoring        = false,
+    modSimple        = false,
+    modPrimitive     = false,
+    slotChoice     = "A",
     priority       = "nearest",
     hover          = 200,
     attackHz       = 20,
@@ -334,6 +355,12 @@ local PERSIST = {
     "multiMin", "refill", "autoReload", "refillTries", "refillHold",
     "refillCooldown", "refillMethod", "autoRetry", "retryCooldown",
     "retryVerify", "tick", "bobAmp", "bobHz", "autoFarm", "autoExecute",
+    "autoSlot", "autoMenu", "slotChoice", "autoStartMissions",
+    "disable3D", "performance", "removeFog",
+    "missionMap", "missionObjective", "modNoPerks", "modNoSkills",
+    "modNoMemories", "modNightmare", "modOddball", "modInjuryProne",
+    "modChronicInjuries", "modFog", "modGlassCannon", "modTimeTrial",
+    "modFatigue", "modEvolution", "modBoring", "modSimple", "modPrimitive",
 }
 
 -- autoFarm is saved only when the player changes it (panel toggle or P). Plain
@@ -373,6 +400,15 @@ local function loadCfg()
 end
 
 loadCfg()
+
+local function slotChoiceOf(value)
+    local letter = string.upper(tostring(value or ""))
+    if letter == "A" or letter == "B" or letter == "C" then return letter end
+    return "A"
+end
+cfg.slotChoice = slotChoiceOf(cfg.slotChoice)
+if type(cfg.autoSlot) ~= "boolean" then cfg.autoSlot = false end
+if type(cfg.autoMenu) ~= "boolean" then cfg.autoMenu = false end
 
 --============================================================================
 --  AUTO EXECUTE
@@ -447,7 +483,7 @@ local function queueFn()
 end
 
 local function sourceHint()
-    return "paste " .. RUN_FILE .. " once"
+    return "paste aotr_run.lua once"
 end
 
 -- The runner and the queued chunk both start with their own marker. Do not
@@ -822,8 +858,7 @@ end
 
 local function dead(model)
     if model == nil or model.Parent == nil then return true end
-    local ok, flag = pcall(function() return model:GetAttribute("Dead") end)
-    if ok and flag == true then return true end
+    if model:GetAttribute("Dead") == true then return true end
     local humanoid = model:FindFirstChildOfClass("Humanoid")
     if not humanoid then return true end
     return humanoid.Health <= 0
@@ -1275,6 +1310,378 @@ end
 local UI = { gui = nil, controls = {}, dragging = false }
 local refreshStatus = function() end
 local refreshControls = function() end
+
+--============================================================================
+--  AUTO MISSIONS
+--  Town Central creates the round through S_Missions, then starts it. The
+--  ladder is highest-first: a refused difficulty falls through to the next.
+--============================================================================
+AutoExec.missionLadder = { "Freedom", "Aberrant", "Severe", "Hard", "Normal", "Easy" }
+AutoExec.missionMaps = {
+    { name = "Shiganshina", objectives = { "Skirmish", "Breach", "Random" } },
+    { name = "Trost", objectives = { "Skirmish", "Protect", "Random" } },
+    { name = "Outskirts", objectives = { "Skirmish", "Escort", "Random" } },
+    { name = "Forest", objectives = { "Skirmish", "Guard", "Random" } },
+    { name = "Utgard", objectives = { "Skirmish", "Defend", "Random" } },
+    { name = "Docks", objectives = { "Skirmish", "Stall", "Random" } },
+    { name = "Stohess", objectives = { "Skirmish", "Random" } },
+    { name = "Chapel", objectives = { "Skirmish", "Random" } },
+}
+AutoExec.missionModDefs = {
+    { name = "No Perks", key = "modNoPerks" },
+    { name = "No Skills", key = "modNoSkills" },
+    { name = "No Memories", key = "modNoMemories" },
+    { name = "Nightmare", key = "modNightmare" },
+    { name = "Oddball", key = "modOddball" },
+    { name = "Injury Prone", key = "modInjuryProne" },
+    { name = "Chronic Injuries", key = "modChronicInjuries" },
+    { name = "Fog", key = "modFog" },
+    { name = "Glass Cannon", key = "modGlassCannon" },
+    { name = "Time Trial", key = "modTimeTrial" },
+    { name = "Fatigue", key = "modFatigue" },
+    { name = "Evolution", key = "modEvolution" },
+    { name = "Boring", key = "modBoring" },
+    { name = "Simple", key = "modSimple" },
+    { name = "Primitive", key = "modPrimitive" },
+}
+
+function AutoExec.missionMapDef(name)
+    for _, def in ipairs(AutoExec.missionMaps) do
+        if def.name == name then return def end
+    end
+    return nil
+end
+
+function AutoExec.missionMapNames()
+    local names = {}
+    for _, def in ipairs(AutoExec.missionMaps) do names[#names + 1] = def.name end
+    return names
+end
+
+function AutoExec.missionObjectiveOptions(name)
+    local def = AutoExec.missionMapDef(name)
+    return def and def.objectives or { "Skirmish", "Random" }
+end
+
+function AutoExec.missionFixSelection()
+    if not AutoExec.missionMapDef(cfg.missionMap) then
+        cfg.missionMap = AutoExec.missionMaps[1].name
+    end
+    local options = AutoExec.missionObjectiveOptions(cfg.missionMap)
+    if table.find(options, cfg.missionObjective) == nil then
+        cfg.missionObjective = table.find(options, "Random") and "Random" or options[1]
+    end
+end
+
+AutoExec.missionBusy = false
+AutoExec.missionNext = 0
+AutoExec.missionMsg = "waiting for a Town Central lobby"
+
+function AutoExec.missionRemotes()
+    local assets = Replicated:FindFirstChild("Assets")
+    local remotes = assets and assets:FindFirstChild("Remotes")
+    local get = remotes and remotes:FindFirstChild("GET")
+    if get and get:IsA("RemoteFunction") then return get end
+    local ok, list = pcall(function() return Replicated:GetDescendants() end)
+    if ok and type(list) == "table" then
+        for _, item in ipairs(list) do
+            if item.Name == "GET" and item:IsA("RemoteFunction") then return item end
+        end
+    end
+    return nil
+end
+
+-- InvokeServer can hang while a place is loading, so every mission call is
+-- timed instead of blocking the whole auto-start loop.
+function AutoExec.missionInvoke(timeout, service, action, ...)
+    local get = AutoExec.missionRemotes()
+    if not get then return false, "GET RemoteFunction not found" end
+    local args = table.pack(...)
+    local done, ok, result = false, false, nil
+    task.spawn(function()
+        ok, result = pcall(get.InvokeServer, get, service, action, table.unpack(args, 1, args.n))
+        done = true
+    end)
+    local started = os.clock()
+    while not done and os.clock() - started < (tonumber(timeout) or 8) do
+        task.wait(0.05)
+    end
+    if not done then return false, "remote timeout" end
+    if not ok then return false, tostring(result) end
+    return true, result
+end
+
+function AutoExec.missionCreate(payload)
+    task.wait(0.15)
+    local ok, result = AutoExec.missionInvoke(8, "S_Missions", "Create", payload)
+    if not ok then return nil, tostring(result) end
+    local isInstance = typeof(result) == "Instance"
+    if not isInstance and type(result) == "table" then
+        local okName, name = pcall(function() return result.Name end)
+        isInstance = okName and name ~= nil
+    end
+    if not isInstance then
+        return nil, "Create returned " .. tostring(result)
+    end
+    AutoExec.missionLobby = result
+    return result
+end
+
+function AutoExec.missionStart()
+    local ok, result = AutoExec.missionInvoke(8, "S_Missions", "Start")
+    if not ok then return false, tostring(result) end
+    if type(result) == "string" and result ~= "" then return false, result end
+    return true
+end
+
+function AutoExec.missionModify(tag)
+    local ok, result = AutoExec.missionInvoke(6, "S_Missions", "Modify", tag)
+    if not ok then return false, tostring(result) end
+    if type(result) == "string" and result ~= "" then return false, result end
+    return true
+end
+
+function AutoExec.missionLeave()
+    AutoExec.missionInvoke(4, "S_Missions", "Leave")
+    AutoExec.missionLobby = nil
+end
+
+function AutoExec.missionModifiers(lobby)
+    local out = {}
+    if not lobby then return out end
+    local ok, value = pcall(function() return lobby:GetAttribute("Modifiers") end)
+    if not ok or value == nil then return out end
+    if type(value) == "table" then
+        for _, entry in pairs(value) do out[tostring(entry)] = true end
+    elseif type(value) == "string" then
+        for entry in string.gmatch(value, "[^,]+") do
+            local name = string.match(entry, "^%s*(.-)%s*$")
+            if name and name ~= "" then out[name] = true end
+        end
+    end
+    return out
+end
+
+-- Turn on the selected modifiers that are still off. The attribute can be an
+-- array or a comma string, so the read helper handles both shapes. Unknown
+-- modifiers are never touched and nothing is toggled blindly.
+function AutoExec.missionApplyModifiers(lobby)
+    task.wait(0.35)
+    local have = AutoExec.missionModifiers(lobby)
+    local changed = 0
+    for _, def in ipairs(AutoExec.missionModDefs) do
+        if cfg[def.key] == true and have[def.name] ~= true then
+            if AutoExec.missionModify(def.name) then changed = changed + 1 end
+            task.wait(0.2)
+        end
+    end
+    return changed
+end
+
+function AutoExec.startMission()
+    AutoExec.missionFixSelection()
+    local payload = {
+        Type = "Missions", Name = cfg.missionMap, Objective = cfg.missionObjective,
+    }
+    local lastError = "no mission difficulty accepted"
+    for _, difficulty in ipairs(AutoExec.missionLadder) do
+        if cfg.autoStartMissions ~= true then
+            return false, "auto missions stopped"
+        end
+        payload.Difficulty = difficulty
+        local lobby, err = AutoExec.missionCreate(payload)
+        if lobby then
+            local changed = AutoExec.missionApplyModifiers(lobby)
+            if cfg.autoStartMissions ~= true then
+                AutoExec.missionLeave()
+                return false, "auto missions stopped"
+            end
+            local started, startError = false, nil
+            for _ = 1, 3 do
+                if cfg.autoStartMissions ~= true then
+                    AutoExec.missionLeave()
+                    return false, "auto missions stopped"
+                end
+                task.wait(0.9)
+                started, startError = AutoExec.missionStart()
+                if started then break end
+            end
+            if started then
+                return true, string.format("%s %s / %s, %d modifier(s)",
+                    difficulty, cfg.missionMap, cfg.missionObjective, changed)
+            end
+            lastError = "start: " .. tostring(startError)
+            AutoExec.missionLeave()
+        else
+            lastError = tostring(err or lastError)
+        end
+        task.wait(0.35)
+    end
+    return false, lastError
+end
+
+function AutoExec.tickMissionStart(now)
+    if cfg.autoStartMissions ~= true then return end
+    if AutoExec.missionBusy then return end
+    local kind = currentKind()
+    if kind ~= "lobby" then
+        if now >= (AutoExec.missionNext or 0) then
+            AutoExec.missionNext = now + 8
+            AutoExec.missionMsg = "waiting for Town Central (" .. tostring(kind) .. ")"
+        end
+        return
+    end
+    -- A lobby is never a results screen; clear a stale flag left by the last
+    -- round so auto start does not wait on it forever when Auto farm is off.
+    if S.results then S.results = false end
+    if roundActive() then
+        AutoExec.missionNext = now + 4
+        return
+    end
+    if now < (AutoExec.missionNext or 0) then return end
+    AutoExec.missionNext = now + 10
+    AutoExec.missionBusy = true
+    local called, ok, detail = pcall(AutoExec.startMission)
+    AutoExec.missionBusy = false
+    if not called then
+        AutoExec.missionMsg = "failed " .. tostring(ok)
+        setError("auto missions", ok)
+        AutoExec.missionNext = clock() + 8
+        refreshStatus()
+        return
+    end
+    AutoExec.missionMsg = (ok and "started " or "failed ") .. tostring(detail)
+    AutoExec.missionNext = clock() + 8
+    refreshStatus()
+end
+
+function AutoExec.sanitizeMissions()
+    if type(cfg.autoStartMissions) ~= "boolean" then cfg.autoStartMissions = false end
+    for _, def in ipairs(AutoExec.missionModDefs) do
+        if type(cfg[def.key]) ~= "boolean" then cfg[def.key] = false end
+    end
+    if type(cfg.missionMap) ~= "string" then cfg.missionMap = "Forest" end
+    if type(cfg.missionObjective) ~= "string" then cfg.missionObjective = "Random" end
+    AutoExec.missionFixSelection()
+end
+AutoExec.sanitizeMissions()
+--============================================================================
+--  VISUALS / PERFORMANCE
+--============================================================================
+AutoExec.Visual = {
+    saved = nil,
+    threeD = false,
+    lighting = game:GetService("Lighting"),
+}
+
+function AutoExec.Visual.sanitize()
+    if type(cfg.disable3D) ~= "boolean" then cfg.disable3D = false end
+    if type(cfg.performance) ~= "boolean" then cfg.performance = false end
+    if type(cfg.removeFog) ~= "boolean" then cfg.removeFog = false end
+end
+
+function AutoExec.Visual.snapshot()
+    local V = AutoExec.Visual
+    if V.saved then return end
+    -- Keep the pre-change values across a reinject: the old script may have
+    -- left 3D off or fog removed, and a fresh capture would call that "stock".
+    local saved = genv.AOTR_VISUAL_SAVED
+    if type(saved) == "table" then
+        V.saved = saved
+        return
+    end
+    saved = {}
+    local lighting = V.lighting
+    pcall(function()
+        saved.fogStart = lighting.FogStart
+        saved.fogEnd = lighting.FogEnd
+        saved.globalShadows = lighting.GlobalShadows
+    end)
+    pcall(function() saved.quality = settings().Rendering.QualityLevel end)
+    if type(getfpscap) == "function" then
+        pcall(function() saved.fps = getfpscap() end)
+    end
+    local atmosphere = lighting:FindFirstChildOfClass("Atmosphere")
+    if atmosphere then
+        saved.atmosphere = atmosphere
+        pcall(function() saved.density = atmosphere.Density end)
+    end
+    V.saved = saved
+    genv.AOTR_VISUAL_SAVED = saved
+end
+
+function AutoExec.Visual.apply()
+    local V = AutoExec.Visual
+    V.sanitize()
+    V.snapshot()
+    local saved = V.saved
+
+    if cfg.removeFog then
+        pcall(function()
+            V.lighting.FogStart = 100000
+            V.lighting.FogEnd = 100000
+        end)
+        if saved.atmosphere then
+            pcall(function() saved.atmosphere.Density = 0 end)
+        end
+    elseif saved then
+        pcall(function()
+            if saved.fogStart ~= nil then V.lighting.FogStart = saved.fogStart end
+            if saved.fogEnd ~= nil then V.lighting.FogEnd = saved.fogEnd end
+        end)
+        if saved.atmosphere and saved.density ~= nil then
+            pcall(function() saved.atmosphere.Density = saved.density end)
+        end
+    end
+
+    if cfg.disable3D then
+        local ok = pcall(function() RunService:Set3dRenderingEnabled(false) end)
+        V.threeD = ok
+        if not ok then S.autoMsg = "3D toggle is not available in this build" end
+    elseif V.threeD then
+        pcall(function() RunService:Set3dRenderingEnabled(true) end)
+        V.threeD = false
+    end
+
+    if cfg.performance then
+        pcall(function() V.lighting.GlobalShadows = false end)
+        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+        if type(setfpscap) == "function" then pcall(setfpscap, 30) end
+    elseif saved then
+        pcall(function()
+            if saved.globalShadows ~= nil then V.lighting.GlobalShadows = saved.globalShadows end
+        end)
+        pcall(function()
+            if saved.quality ~= nil then settings().Rendering.QualityLevel = saved.quality end
+        end)
+        if saved.fps and type(setfpscap) == "function" then pcall(setfpscap, saved.fps) end
+    end
+end
+
+function AutoExec.Visual.restore()
+    local V = AutoExec.Visual
+    -- Always ask for 3D back, even if this execution never turned it off.
+    pcall(function() RunService:Set3dRenderingEnabled(true) end)
+    V.threeD = false
+    local saved = V.saved
+    if saved then
+        pcall(function()
+            if saved.fogStart ~= nil then V.lighting.FogStart = saved.fogStart end
+            if saved.fogEnd ~= nil then V.lighting.FogEnd = saved.fogEnd end
+            if saved.globalShadows ~= nil then V.lighting.GlobalShadows = saved.globalShadows end
+        end)
+        pcall(function()
+            if saved.quality ~= nil then settings().Rendering.QualityLevel = saved.quality end
+        end)
+        if saved.fps and type(setfpscap) == "function" then pcall(setfpscap, saved.fps) end
+        if saved.atmosphere and saved.density ~= nil then
+            pcall(function() saved.atmosphere.Density = saved.density end)
+        end
+    end
+    V.saved = nil
+    genv.AOTR_VISUAL_SAVED = nil
+end
+
 --============================================================================
 local GuiAuto = {}
 
@@ -1365,6 +1772,46 @@ end
 function GuiAuto.findButton(aliases, scope, exclude)
     return GuiAuto.findAll(aliases, scope, exclude)[1]
 end
+
+-- Mobile executors commonly lack mouse and keyboard APIs, but the game's own
+-- GUI buttons still expose their normal signal handlers.
+local function fireGuiButton(button)
+    if not button or not button.Parent then return false end
+    for _, name in ipairs({ "Activated", "MouseButton1Click" }) do
+        if caps.getconnections then
+            local ok, list = pcall(getconnections, button[name])
+            if ok and type(list) == "table" then
+                local fired = false
+                for _, connection in ipairs(list) do
+                    if connection.Enabled ~= false
+                        and pcall(function() connection:Fire() end) then
+                        fired = true
+                    end
+                end
+                if fired then return true end
+            end
+        end
+        if caps.firesignal and pcall(firesignal, button[name]) then return true end
+    end
+    -- Some mobile buttons only implement the down/up pair, not Activated.
+    local downUp = false
+    for _, name in ipairs({ "MouseButton1Down", "MouseButton1Up" }) do
+        if caps.getconnections then
+            local ok, list = pcall(getconnections, button[name])
+            if ok and type(list) == "table" then
+                for _, connection in ipairs(list) do
+                    if connection.Enabled ~= false
+                        and pcall(function() connection:Fire() end) then
+                        downUp = true
+                    end
+                end
+            end
+        end
+        if caps.firesignal and pcall(firesignal, button[name]) then downUp = true end
+    end
+    return downUp
+end
+
 function GuiAuto.centre(button)
     local ok, position, size = pcall(function()
         return button.AbsolutePosition, button.AbsoluteSize
@@ -1421,42 +1868,753 @@ function GuiAuto.hits(button)
 end
 
 --============================================================================
-local function clusterAt(model)
-    local probe = napeOf(model)
-    if not probe then return 0 end
-    local okPos, centre = pcall(function() return probe.Position end)
-    if not okPos or not centre then return 0 end
-    local folder = workspace:FindFirstChild("Titans")
-    if not folder then return 0 end
-    local count = 0
-    for _, other in ipairs(folder:GetChildren()) do
-        if other:IsA("Model") and other ~= model and not dead(other) then
-            local nape = napeOf(other)
-            if nape then
-                local ok, position = pcall(function() return nape.Position end)
-                if ok and position and (position - centre).Magnitude <= cfg.multiRadius then
-                    count = count + 1
+--  AUTO SLOT
+--============================================================================
+local AutoSlot = {
+    button = nil, letter = nil, nextScanAt = 0, attemptsAt = 0,
+    attempts = 0, failed = 0, doneButton = nil, reason = nil, idleUntil = 0,
+    msg = "waiting for slot screen",
+}
+
+local function slotRoots()
+    local roots, seen = {}, {}
+    local playerGui = getPlayerGui()
+    if playerGui then
+        roots[#roots + 1] = playerGui
+        seen[playerGui] = true
+    end
+    if caps.gethui then
+        local hidden = probe(gethui)
+        if hidden and not seen[hidden] then roots[#roots + 1] = hidden end
+    end
+    return roots
+end
+
+local function slotVisible(instance)
+    if not instance or not guiVisible(instance) then return false end
+    local node = instance
+    while node do
+        local okScreen, isScreen = pcall(function() return node:IsA("ScreenGui") end)
+        if okScreen and isScreen then
+            local okEnabled, enabled = pcall(function() return node.Enabled end)
+            if okEnabled and enabled == false then return false end
+        end
+        node = node.Parent
+    end
+    return true
+end
+
+function AutoSlot.slotScreen()
+    for _, root in ipairs(slotRoots()) do
+        local interface = root:FindFirstChild("Interface")
+        local title = interface and interface:FindFirstChild("Title_Screen")
+        local slots = title and title:FindFirstChild("Slots")
+        if slots and slotVisible(slots) then return slots end
+    end
+    return nil
+end
+
+local function slotText(instance)
+    local ok, text = pcall(function() return instance.Text end)
+    if ok and type(text) == "string" then return normText(text) end
+    return ""
+end
+
+local function slotName(instance)
+    local ok, name = pcall(function() return instance.Name end)
+    if ok and type(name) == "string" then return normText(name) end
+    return ""
+end
+
+local function slotChildText(instance)
+    local ok, label = pcall(function()
+        return instance:FindFirstChildWhichIsA("TextLabel", true)
+    end)
+    if not ok or not label then return "" end
+    local okText, text = pcall(function() return label.Text end)
+    if okText and type(text) == "string" then return normText(text) end
+    return ""
+end
+
+local function slotTitleMatches(instance, letter)
+    local needle = "slot" .. string.lower(letter)
+    return string.find(slotText(instance), needle, 1, true) ~= nil
+        or string.find(slotName(instance), needle, 1, true) ~= nil
+        or string.find(slotChildText(instance), needle, 1, true) ~= nil
+end
+
+local function slotActionValue(value)
+    if value == "" then return false end
+    if string.find(value, "unlock", 1, true)
+        or string.find(value, "purchase", 1, true)
+        or string.find(value, "locked", 1, true) then
+        return false
+    end
+    if value == "select" or value == "selectslot"
+        or value == "play" or value == "load"
+        or value == "continue" or value == "enter" then
+        return true
+    end
+    return string.sub(value, 1, 6) == "select"
+        and not string.find(value, "selected", 1, true)
+        and not string.find(value, "selection", 1, true)
+end
+
+local function slotSelectButton(instance)
+    local text, name, child = slotText(instance), slotName(instance), slotChildText(instance)
+    local values = { text, name, child }
+    for _, value in ipairs(values) do
+        if value ~= "" and (string.find(value, "unlock", 1, true)
+            or string.find(value, "purchase", 1, true)
+            or string.find(value, "locked", 1, true)) then
+            return false
+        end
+    end
+    for _, value in ipairs(values) do
+        if slotActionValue(value) then return true end
+    end
+    return false
+end
+
+local function isButton(instance)
+    local ok, value = pcall(function() return instance:IsA("GuiButton") end)
+    return ok and value
+end
+
+local function findSelectIn(scope)
+    local ok, descendants = pcall(function() return scope:GetDescendants() end)
+    if ok and type(descendants) == "table" then
+        for _, candidate in ipairs(descendants) do
+            if isButton(candidate) and not isOurs(candidate)
+                and slotSelectButton(candidate) and slotVisible(candidate) then
+                return candidate
+            end
+        end
+    end
+    if isButton(scope) and not isOurs(scope)
+        and slotSelectButton(scope) and slotVisible(scope) then
+        return scope
+    end
+    return nil
+end
+
+local function allSelectButtons(scope)
+    local found, seen = {}, {}
+    for _, root in ipairs(scope and { scope } or slotRoots()) do
+        local ok, descendants = pcall(function() return root:GetDescendants() end)
+        if ok and type(descendants) == "table" then
+            for _, candidate in ipairs(descendants) do
+                if not seen[candidate] and isButton(candidate) and not isOurs(candidate)
+                    and slotSelectButton(candidate) and slotVisible(candidate) then
+                    seen[candidate] = true
+                    found[#found + 1] = candidate
                 end
             end
         end
     end
-    return count
+    table.sort(found, function(a, b)
+        local oka, pa = pcall(function() return a.AbsolutePosition end)
+        local okb, pb = pcall(function() return b.AbsolutePosition end)
+        if not oka or not okb or not pa or not pb then return false end
+        if pa.X ~= pb.X then return pa.X < pb.X end
+        return pa.Y < pb.Y
+    end)
+    return found
 end
 
+local function slotScopeHasOtherTitle(scope, letter)
+    local ok, descendants = pcall(function() return scope:GetDescendants() end)
+    if not ok or type(descendants) ~= "table" then return false end
+    for _, candidate in ipairs(descendants) do
+        for _, other in ipairs({ "A", "B", "C" }) do
+            if other ~= letter and slotTitleMatches(candidate, other)
+                and not isOurs(candidate) and slotVisible(candidate) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function slotScreenPresent(scope)
+    for _, root in ipairs(scope and { scope } or slotRoots()) do
+        local ok, descendants = pcall(function() return root:GetDescendants() end)
+        if ok and type(descendants) == "table" then
+            for _, candidate in ipairs(descendants) do
+                for _, letter in ipairs({ "A", "B", "C" }) do
+                    if slotTitleMatches(candidate, letter)
+                        and not isOurs(candidate) and slotVisible(candidate) then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function findSlotByTitle(letter, scope)
+    local sawTitle = false
+    for _, root in ipairs(scope and { scope } or slotRoots()) do
+        local ok, descendants = pcall(function() return root:GetDescendants() end)
+        if ok and type(descendants) == "table" then
+            for _, candidate in ipairs(descendants) do
+                if candidate ~= root and not isOurs(candidate)
+                    and slotTitleMatches(candidate, letter) and slotVisible(candidate)
+                    and not slotScopeHasOtherTitle(candidate, letter) then
+                    sawTitle = true
+                    local node = candidate
+                    for _ = 1, 8 do
+                        if slotScopeHasOtherTitle(node, letter) then break end
+                        local button = findSelectIn(node)
+                        if button then return button, "title" end
+                        node = node.Parent
+                        if not node then break end
+                    end
+                end
+            end
+        end
+    end
+    if sawTitle then return nil, "locked" end
+    return nil, "waiting"
+end
+
+local function findSlotButton(letter)
+    -- The slot picker only exists on the title screen. Never fall back to a
+    -- global "select/play" scan: Town Central has several such buttons and the
+    -- old fallback clicked them while the player was in the lobby.
+    local screen = AutoSlot.slotScreen()
+    if not screen then return nil, "waiting" end
+    local card = screen:FindFirstChild(letter)
+    if card then
+        local direct = card:FindFirstChild("Select_" .. letter)
+        if direct and isButton(direct) and slotVisible(direct) then
+            return direct, "direct"
+        end
+        local okUnlocked, unlocked = pcall(function()
+            return card:GetAttribute("Unlocked")
+        end)
+        if okUnlocked and unlocked == false then return nil, "locked" end
+    end
+    local button, reason = findSlotByTitle(letter, screen)
+    if button then return button, reason end
+    if reason == "locked" then return nil, reason end
+    local buttons = allSelectButtons(screen)
+    if #buttons == 3 and slotScreenPresent(screen) then
+        local index = letter == "A" and 1 or (letter == "B" and 2 or 3)
+        return buttons[index], "order"
+    end
+    if #buttons == 1 and letter == "A" then return buttons[1], "single" end
+    return nil, "waiting"
+end
+
+local function slotClickFinished(button)
+    return not button or not button.Parent or not slotVisible(button)
+end
+
+-- Roblox's Backslash UI-selection mode is keyboard-only: \ toggles selection,
+-- the selected GuiObject is activated with Return. This never moves the mouse.
+local function slotKeyboardClick(button)
+    local gui = game:GetService("GuiService")
+    local okPrev, previous = pcall(function() return gui.SelectedObject end)
+    local wasSelected = okPrev and previous ~= nil
+    pcall(function() gui.AutoSelectGuiEnabled = true end)
+    if not wasSelected then
+        pcall(function() keyTap(Enum.KeyCode.Backslash, 0.03) end)
+        task.wait(0.05)
+    end
+    if not pcall(function() gui.SelectedObject = button end) then
+        return false, "select failed"
+    end
+    local sent = false
+    if caps.vim then
+        sent = pcall(function()
+            caps.vim:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+            task.wait(0.06)
+            caps.vim:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+        end)
+    end
+    if not sent then
+        sent = pcall(function() keyTap(Enum.KeyCode.Return, 0.05) end)
+    end
+    task.wait(0.15)
+    pcall(function() gui.SelectedObject = (okPrev and previous) or nil end)
+    if not wasSelected then
+        pcall(function() keyTap(Enum.KeyCode.Backslash, 0.03) end)
+    end
+    return sent, "keyboard"
+end
+
+local function slotScreenPoint(button, pointOverride)
+    local point = pointOverride or GuiAuto.centre(button)
+    if not point then return nil end
+    local screen = button
+    while screen and not screen:IsA("ScreenGui") do screen = screen.Parent end
+    if screen then
+        local ignore = false
+        pcall(function() ignore = screen.IgnoreGuiInset == true end)
+        if not ignore then
+            local ok, topLeft = pcall(function()
+                return game:GetService("GuiService"):GetGuiInset()
+            end)
+            if ok and typeof(topLeft) == "Vector2" then
+                point = point + topLeft
+            end
+        end
+    end
+    return point
+end
+
+local function slotTouchClick(button, pointOverride)
+    local point = slotScreenPoint(button, pointOverride)
+    if not point or not caps.vim then return false, "no touch" end
+    local hasTouch = false
+    pcall(function() hasTouch = type(caps.vim.SendTouchEvent) == "function" end)
+    if not hasTouch then return false, "no touch" end
+    local touchId = math.floor((os.clock() * 1000) % 2147483647) + 1
+    local x, y = math.floor(point.X), math.floor(point.Y)
+    local ok = pcall(function()
+        caps.vim:SendTouchEvent(touchId, 0, x, y)
+        task.wait(0.08)
+        caps.vim:SendTouchEvent(touchId, 2, x, y)
+    end)
+    if not ok then
+        pcall(function() caps.vim:SendTouchEvent(touchId, 3, x, y) end)
+    end
+    return ok, "touch"
+end
+
+local function clickSlotButton(button)
+    local point = GuiAuto.centre(button)
+    local function verify(method)
+        task.wait(0.2)
+        if slotClickFinished(button) then return true, method end
+        return false
+    end
+    -- Touch is the native mobile activation. It does not use the Backslash UI
+    -- selection mode, and like every other path it is verified before success.
+    if IS_MOBILE then
+        local sent = slotTouchClick(button)
+        if sent then
+            local done, method = verify("touch")
+            if done then return true, method end
+        end
+    end
+    -- Backslash/Return is the non-mouse desktop activation path. A signal fire
+    -- can look successful and still do nothing, so every path is checked against
+    -- the button actually leaving the screen.
+    local sent = slotKeyboardClick(button)
+    if sent then
+        local done, method = verify("keyboard")
+        if done then return true, method end
+    end
+    if point and caps.vim then
+        local ok = pcall(function()
+            if caps.vim.SendMouseMoveEvent then
+                caps.vim:SendMouseMoveEvent(point.X, point.Y, game)
+                task.wait(0.03)
+            end
+            caps.vim:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 1)
+            task.wait(0.03)
+            caps.vim:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 1)
+        end)
+        if ok then
+            local done, method = verify("click")
+            if done then return true, method end
+        end
+    end
+    if fireGuiButton(button) then
+        local done, method = verify("signal")
+        if done then return true, method end
+    end
+    return false, "no response"
+end
+
+function AutoSlot.reset(reason)
+    AutoSlot.button = nil
+    AutoSlot.letter = nil
+    AutoSlot.nextScanAt = 0
+    AutoSlot.attemptsAt = 0
+    AutoSlot.attempts = 0
+    AutoSlot.failed = 0
+    AutoSlot.doneButton = nil
+    AutoSlot.reason = nil
+    AutoSlot.idleUntil = 0
+    AutoSlot.msg = reason or "waiting for slot screen"
+end
+
+function AutoSlot.tick(now)
+    if cfg.autoSlot ~= true then
+        AutoSlot.button, AutoSlot.letter, AutoSlot.doneButton = nil, nil, nil
+        AutoSlot.msg = "off"
+        return
+    end
+    now = now or clock()
+    local screen = AutoSlot.slotScreen()
+    if not screen then
+        AutoSlot.button, AutoSlot.letter, AutoSlot.doneButton = nil, nil, nil
+        AutoSlot.idleUntil = 0
+        AutoSlot.msg = "waiting for slot screen"
+        return
+    end
+    if now < (AutoSlot.idleUntil or 0) then return end
+    local letter = slotChoiceOf(cfg.slotChoice)
+    if AutoSlot.letter ~= letter then AutoSlot.reset("choice " .. letter) end
+    local button = AutoSlot.button
+    if button and (not button.Parent or not slotVisible(button)) then
+        local wasDone = AutoSlot.doneButton == button
+        AutoSlot.button, AutoSlot.doneButton = nil, nil
+        if wasDone then AutoSlot.idleUntil = now + 8 end
+        button = nil
+    end
+    if not button then
+        if now < (AutoSlot.nextScanAt or 0) then return end
+        AutoSlot.nextScanAt = now + 2
+        local reason
+        button, reason = findSlotButton(letter)
+        AutoSlot.reason = reason
+        AutoSlot.button = button
+        AutoSlot.letter = letter
+        AutoSlot.failed = 0
+        if not button then
+            AutoSlot.msg = reason == "locked"
+                and ("slot " .. letter .. " locked/no SELECT")
+                or "waiting for slot screen"
+            return
+        end
+    end
+    if AutoSlot.doneButton == button then
+        -- Only a verified click sets doneButton. If the screen is still here,
+        -- let the retry path run instead of claiming success forever.
+        AutoSlot.doneButton = nil
+    end
+    if AutoSlot.attempts > 0 and now - (AutoSlot.attemptsAt or 0) < 2 then return end
+    AutoSlot.attemptsAt = now
+    local ok, method = clickSlotButton(button)
+    AutoSlot.attempts = (AutoSlot.attempts or 0) + 1
+    if ok then
+        AutoSlot.doneButton = button
+        AutoSlot.idleUntil = now + 3
+        AutoSlot.msg = "selected slot " .. letter .. " (" .. method .. ")"
+    else
+        AutoSlot.failed = (AutoSlot.failed or 0) + 1
+        AutoSlot.msg = "slot " .. letter .. " SELECT found; no response"
+        AutoSlot.idleUntil = now + math.min(2 + AutoSlot.failed, 8)
+    end
+    refreshStatus()
+end
+
+function AutoSlot.describe()
+    local letter = slotChoiceOf(cfg.slotChoice)
+    if cfg.autoSlot ~= true then return "OFF   choice " .. letter end
+    return "ON   choice " .. letter .. "   " .. tostring(AutoSlot.msg or "waiting")
+end
+
+safeSpawn(function()
+    while true do
+        task.wait(0.5)
+        local ok, err = pcall(AutoSlot.tick, clock())
+        if not ok then setError("auto slot", err) end
+    end
+end, "auto slot")
+
+--============================================================================
+--  AUTO MENU
+--============================================================================
+AutoSlot.menu = {
+    button = nil, title = nil, attemptsAt = 0, attempts = 0, failed = 0,
+    nextScanAt = 0, idleUntil = 0, promptNextAt = 0, slotAt = 0, slotClicked = nil,
+    msg = "waiting for title PLAY",
+}
+
+function AutoSlot.menuTitleScreen()
+    local playerGui = getPlayerGui()
+    local interface = playerGui and playerGui:FindFirstChild("Interface")
+    local title = interface and interface:FindFirstChild("Title_Screen")
+    if title and slotVisible(title) then return title end
+    return nil
+end
+
+-- The game asks "Would you like to do the tutorial to earn 1,000 Gems?"
+-- on a fresh account. Find the prompt by its text, then locate its exact NO
+-- button inside the same modal so an unrelated "No" elsewhere is never hit.
+function AutoSlot.menuTutorialNo()
+    for _, root in ipairs(guiRoots()) do
+        local ok, descendants = pcall(function() return root:GetDescendants() end)
+        if ok and type(descendants) == "table" then
+            for _, candidate in ipairs(descendants) do
+                if not isOurs(candidate) and slotVisible(candidate) then
+                    local text = slotText(candidate)
+                    if text == "" then text = slotChildText(candidate) end
+                    if string.find(text, "tutorial", 1, true)
+                        and string.find(text, "gems", 1, true) then
+                        local scope = candidate
+                        for _ = 1, 6 do
+                            if not scope then break end
+                            for _, button in ipairs(GuiAuto.findAll({ "no" }, scope)) do
+                                local label = slotText(button)
+                                if label == "" then label = slotChildText(button) end
+                                if label == "" then label = slotName(button) end
+                                if label == "no" or label == "nope" or label == "nothanks" then
+                                    return button, scope, candidate
+                                end
+                            end
+                            scope = scope.Parent
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function AutoSlot.menuPlayButton()
+    local title = AutoSlot.menuTitleScreen()
+    if not title then return nil, nil, "no title" end
+    local buttons = title:FindFirstChild("Buttons")
+    local play = buttons and buttons:FindFirstChild("Play")
+    local interact = play and play:FindFirstChild("Interact")
+    if interact and interact:IsA("GuiButton") and slotVisible(interact) then
+        return interact, title, "play"
+    end
+    local start = title:FindFirstChild("Start")
+    local startFrame = start and start:FindFirstChild("Start")
+    local startButton = startFrame and startFrame:FindFirstChild("Interact")
+    if startButton and startButton:IsA("GuiButton") and slotVisible(startButton) then
+        return startButton, title, "start"
+    end
+    local found = GuiAuto.findButton({ "play" }, title)
+    if found and slotVisible(found) then return found, title, "scan" end
+    return nil, title, "no play"
+end
+
+function AutoSlot.menuAlternatePlay(button)
+    local title = AutoSlot.menuTitleScreen()
+    if not title then return nil end
+    local start = title:FindFirstChild("Start")
+    local startFrame = start and start:FindFirstChild("Start")
+    local startButton = startFrame and startFrame:FindFirstChild("Interact")
+    if startButton and startButton ~= button
+        and startButton:IsA("GuiButton") and slotVisible(startButton) then
+        return startButton
+    end
+    local buttons = title:FindFirstChild("Buttons")
+    local play = buttons and buttons:FindFirstChild("Play")
+    local interact = play and play:FindFirstChild("Interact")
+    if interact and interact ~= button
+        and interact:IsA("GuiButton") and slotVisible(interact) then
+        return interact
+    end
+    for _, candidate in ipairs(GuiAuto.findAll({ "play" }, title)) do
+        if candidate ~= button and slotVisible(candidate) then return candidate end
+    end
+    return nil
+end
+
+function AutoSlot.menuClick(button, title)
+    local function done(method)
+        task.wait(0.35)
+        if slotClickFinished(button) or not slotVisible(title) then return true, method end
+        return false
+    end
+    if IS_MOBILE then
+        local sent = slotTouchClick(button)
+        if sent then
+            local ok, method = done("touch")
+            if ok then return true, method end
+        end
+        -- PLAY overlaps a slot card at its centre on the title layout. Try the
+        -- clear left/right edges before falling back to keyboard and signals.
+        local okPos, position, size = pcall(function()
+            return button.AbsolutePosition, button.AbsoluteSize
+        end)
+        if okPos and position and size then
+            for _, fraction in ipairs({ 0.12, 0.88 }) do
+                local point = Vector2.new(
+                    position.X + size.X * fraction,
+                    position.Y + size.Y / 2)
+                sent = slotTouchClick(button, point)
+                if sent then
+                    local ok, method = done("touch")
+                    if ok then return true, method end
+                end
+            end
+        end
+    end
+    local sent = slotKeyboardClick(button)
+    if sent then
+        local ok, method = done("keyboard")
+        if ok then return true, method end
+    end
+    if fireGuiButton(button) then
+        local ok, method = done("signal")
+        if ok then return true, method end
+    end
+    return false, "no response"
+end
+
+function AutoSlot.resetMenu(reason)
+    local menu = AutoSlot.menu
+    menu.button = nil
+    menu.title = nil
+    menu.attemptsAt = 0
+    menu.attempts = 0
+    menu.failed = 0
+    menu.nextScanAt = 0
+    menu.idleUntil = 0
+    menu.promptNextAt = 0
+    menu.slotAt = 0
+    menu.slotClicked = nil
+    menu.msg = reason or "waiting for title PLAY"
+end
+
+function AutoSlot.tickMenu(now)
+    local menu = AutoSlot.menu
+    if cfg.autoMenu ~= true then
+        menu.button = nil
+        menu.msg = "off"
+        return
+    end
+    now = now or clock()
+    if now >= (menu.promptNextAt or 0) then
+        menu.promptNextAt = now + 0.75
+        local noButton, promptScope, promptLabel = AutoSlot.menuTutorialNo()
+        if noButton then
+            menu.button = nil
+            local ok, method = clickSlotButton(noButton)
+            if not ok then
+                -- Some mobile executors select NO but never deliver Return.
+                -- Remove the control first, then hide only the dialog that
+                -- contains it; never hide PlayerGui or the whole game UI.
+                local hid = pcall(function() noButton.Visible = false end)
+                local prompt = promptScope
+                if not prompt or not prompt:IsA("GuiObject")
+                    or prompt:IsA("PlayerGui") or prompt:IsA("ScreenGui") then
+                    prompt = noButton.Parent
+                end
+                if prompt and prompt:IsA("GuiObject")
+                    and not prompt:IsA("PlayerGui") then
+                    if pcall(function() prompt.Visible = false end) then hid = true end
+                end
+                if promptLabel and promptLabel:IsA("GuiObject") then
+                    pcall(function() promptLabel.Visible = false end)
+                    local holder = promptLabel.Parent
+                    if holder and holder:IsA("GuiObject")
+                        and not holder:IsA("PlayerGui")
+                        and not holder:IsA("ScreenGui") then
+                        pcall(function() holder.Visible = false end)
+                    end
+                end
+                if not hid then
+                    hid = pcall(function() noButton:Destroy() end)
+                end
+                if hid then ok, method = true, "hidden" end
+            end
+            menu.promptNextAt = now + (ok and 2 or 1)
+            menu.idleUntil = now + (ok and 1.5 or 2)
+            menu.msg = ok
+                and ("tutorial: pressed NO (" .. tostring(method) .. ")")
+                or "tutorial NO found; no response"
+            refreshStatus()
+            return
+        end
+    end
+    if not AutoSlot.slotScreen() then menu.slotClicked = nil end
+    if cfg.autoSlot ~= true and not menu.slotClicked
+        and now >= (menu.slotAt or 0) and AutoSlot.slotScreen() then
+        menu.slotAt = now + 2
+        local letter = slotChoiceOf(cfg.slotChoice)
+        local slotButton = findSlotButton(letter)
+        if slotButton then
+            local ok, method = clickSlotButton(slotButton)
+            menu.msg = ok
+                and ("slot " .. letter .. ": pressed SELECT (" .. tostring(method) .. ")")
+                or ("slot " .. letter .. " SELECT found; no response")
+            menu.idleUntil = now + (ok and 1 or 2)
+            if ok then menu.slotClicked = true end
+            refreshStatus()
+            return
+        end
+    end
+    if now < (menu.idleUntil or 0) then return end
+    if now < (menu.nextScanAt or 0) then return end
+    menu.nextScanAt = now + 1
+    -- The slot cards can remain visible after selecting A, so do not block PLAY
+    -- on slotScreenPresent here; the slot loop handles selection independently.
+    local button, title, reason = AutoSlot.menuPlayButton()
+    menu.title = title
+    if not button then
+        menu.button = nil
+        menu.msg = reason == "no title" and "waiting for title" or "waiting for title PLAY"
+        return
+    end
+    if menu.button ~= button then
+        menu.button = button
+        menu.attempts = 0
+        menu.failed = 0
+    end
+    if menu.attempts > 0 and now - (menu.attemptsAt or 0) < 2 then return end
+    menu.attemptsAt = now
+    local ok, method = AutoSlot.menuClick(button, title)
+    if not ok then
+        local alternate = AutoSlot.menuAlternatePlay(button)
+        if alternate then
+            ok, method = AutoSlot.menuClick(alternate, title)
+        end
+    end
+    menu.attempts = (menu.attempts or 0) + 1
+    if ok then
+        menu.idleUntil = now + 8
+        menu.msg = "pressed PLAY (" .. method .. ")"
+    else
+        menu.failed = (menu.failed or 0) + 1
+        menu.idleUntil = now + math.min(2 + menu.failed, 8)
+        menu.msg = "PLAY found; no response"
+    end
+    refreshStatus()
+end
+
+function AutoSlot.describeMenu()
+    if cfg.autoMenu ~= true then return "OFF" end
+    return "ON   " .. tostring(AutoSlot.menu.msg or "waiting for title PLAY")
+end
+
+safeSpawn(function()
+    while true do
+        task.wait(0.5)
+        local ok, err = pcall(AutoSlot.tickMenu, clock())
+        if not ok then setError("auto menu", err) end
+    end
+end, "auto menu")
+
+safeSpawn(function()
+    while true do
+        task.wait(1)
+        local ok, err = pcall(AutoExec.tickMissionStart, clock())
+        if not ok then setError("auto missions", err) end
+    end
+end, "auto missions")
+
+--============================================================================
 local function clusterCentre(model)
     local probe = napeOf(model)
     if not probe then return nil end
-    local okPos, centre = pcall(function() return probe.Position end)
-    if not okPos or not centre then return nil end
+    local centre = probe.Position
     local folder = workspace:FindFirstChild("Titans")
     if not folder then return centre end
+    local radius = tonumber(cfg.multiRadius) or 45
+    local radiusSq = radius * radius
     local sum, count = Vector3.new(0, 0, 0), 0
     for _, other in ipairs(folder:GetChildren()) do
         if other:IsA("Model") and other ~= model and not dead(other) then
             local nape = napeOf(other)
             if nape then
-                local ok, position = pcall(function() return nape.Position end)
-                if ok and position and (position - centre).Magnitude <= cfg.multiRadius then
+                local position = nape.Position
+                local dx = position.X - centre.X
+                local dy = position.Y - centre.Y
+                local dz = position.Z - centre.Z
+                if dx * dx + dy * dy + dz * dz <= radiusSq then
                     sum = sum + position
                     count = count + 1
                 end
@@ -1487,6 +2645,7 @@ local function chooseTarget()
     local _, root = myChar()
     if not folder or not root then return nil end
     local origin = root.Position
+    local char = localChar()
     local boss = attackTitan()
 
     if boss and not roaring(boss) and cfg.priority ~= "hp" then
@@ -1497,24 +2656,46 @@ local function chooseTarget()
         end
     end
 
-    local best, bestScore = nil, nil
+    -- Read each titan's nape, root and health once, then score the crowd from
+    -- those cached positions. The old loop re-scanned every titan for every
+    -- candidate, which was quadratic in instance-property reads.
+    local candidates = {}
     for _, model in ipairs(folder:GetChildren()) do
-        if model:IsA("Model") and model ~= localChar() and not dead(model) and not (model == boss and roaring(model)) then
+        if model:IsA("Model") and model ~= char and not dead(model)
+            and not (model == boss and roaring(model)) then
             local nape = napeOf(model)
             local hrp = model:FindFirstChild("HumanoidRootPart")
             if nape and hrp then
-                local distance = (hrp.Position - origin).Magnitude
-                local score = distance
-                if cfg.priority == "hp" then score = hpOf(model) * 10000 + distance end
-                if cfg.multiHit then
-                    local crowd = clusterAt(model)
-                    if crowd >= cfg.multiMin then score = score - crowd * 1000 end
-                end
-                if bestScore == nil or score < bestScore then
-                    bestScore = score
-                    best = { model = model, nape = nape, name = model.Name, dist = distance }
+                candidates[#candidates + 1] = {
+                    model = model, nape = nape, name = model.Name,
+                    dist = (hrp.Position - origin).Magnitude,
+                    pos = nape.Position,
+                    hp = cfg.priority == "hp" and hpOf(model) or nil,
+                }
+            end
+        end
+    end
+
+    local best, bestScore = nil, nil
+    local radius = tonumber(cfg.multiRadius) or 45
+    local radiusSq = radius * radius
+    for index, candidate in ipairs(candidates) do
+        local score = candidate.dist
+        if candidate.hp ~= nil then score = candidate.hp * 10000 + score end
+        if cfg.multiHit then
+            local crowd = 0
+            local px, py, pz = candidate.pos.X, candidate.pos.Y, candidate.pos.Z
+            for otherIndex, other in ipairs(candidates) do
+                if otherIndex ~= index then
+                    local dx, dy, dz = other.pos.X - px, other.pos.Y - py, other.pos.Z - pz
+                    if dx * dx + dy * dy + dz * dz <= radiusSq then crowd = crowd + 1 end
                 end
             end
+            if crowd >= cfg.multiMin then score = score - crowd * 1000 end
+        end
+        if bestScore == nil or score < bestScore then
+            bestScore = score
+            best = candidate
         end
     end
     return best
@@ -1974,8 +3155,8 @@ if RunService then
 end
 -- locked; every 50 swings the ladder is re-tested.
 local Path = {
-    order = { "gui", "remote", "mouse" }, index = 1, locked = nil, testAt = 0,
-    counters = {}, msg = nil,
+    order = IS_MOBILE and { "gui", "remote" } or { "gui", "remote", "mouse" },
+    index = 1, locked = nil, testAt = 0, counters = {}, msg = nil,
 }
 
 function Path.reset()
@@ -1989,8 +3170,9 @@ end
 
 function Path.current()
     local mode = cfg.attackPath or "auto"
+    if IS_MOBILE and mode == "mouse" then mode = "auto" end
     if mode ~= "auto" then return mode end
-    if Path.locked then return Path.locked end
+    if Path.locked and not (IS_MOBILE and Path.locked == "mouse") then return Path.locked end
     return Path.order[Path.index] or "gui"
 end
 
@@ -2437,15 +3619,16 @@ local function setOwner(name)
 end
 
 local function hoverStep(dt)
-    local _, root, humanoid = myChar()
     if not S.running or S.owner ~= "farm" or not Hover.base then
         Hover.goal = nil
         if Hover.wasOwner then
+            local _, root = myChar()
             if root then pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end) end
             Hover.wasOwner = false
         end
         return
     end
+    local _, root, humanoid = myChar()
     if not root then Hover.wasOwner = false return end
     if S.results or S.refilling or S.reloading or (humanoid and humanoid.Health <= 0) then
         pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
@@ -2572,10 +3755,7 @@ function Refill.bladeCounts(char)
                 local blade = hand:FindFirstChild("Blade_" .. index)
                 if blade then
                     total = total + 1
-                    local ok, transparency = pcall(function() return blade.Transparency end)
-                    if ok and type(transparency) == "number" and transparency >= 0.95 then
-                        clear = clear + 1
-                    end
+                    if blade.Transparency >= 0.95 then clear = clear + 1 end
                 end
             end
         end
@@ -2599,10 +3779,10 @@ function Refill.readBlades(char)
         end
     end
     if gradient then
-        local okX, x = pcall(function() return gradient.Offset.X end)
-        local okY, y = pcall(function() return gradient.Offset.Y end)
-        if okX and type(x) == "number" and x == x then
-            S.durabilityX, S.durabilityY = x, okY and y or nil
+        local offset = gradient.Offset
+        local x, y = offset.X, offset.Y
+        if type(x) == "number" and x == x then
+            S.durabilityX, S.durabilityY = x, y
             S.durabilitySource = "gradient"
             S.durability = x
             local total, clear = Refill.bladeCounts(char)
@@ -2681,6 +3861,57 @@ local function findPrompt(part)
     return nil
 end
 
+local function firePrompt(prompt)
+    if not prompt then return false end
+    pcall(function() prompt.HoldDuration = 0 end)
+    if caps.prompt and pcall(fireproximityprompt, prompt) then return true end
+    local holdBegin = false
+    pcall(function() holdBegin = type(prompt.InputHoldBegin) == "function" end)
+    if holdBegin then
+        if pcall(function() prompt:InputHoldBegin() end) then
+            task.wait(0.05)
+            pcall(function() prompt:InputHoldEnd() end)
+            return true
+        end
+    end
+    return false
+end
+
+local MobileReload = { button = nil, scannedAt = 0 }
+local function mobileReloadButton()
+    if MobileReload.button and MobileReload.button.Parent then return MobileReload.button end
+    local now = clock()
+    if now < (MobileReload.scannedAt or 0) then return nil end
+    MobileReload.scannedAt = now + 1
+    local gui = getPlayerGui()
+    MobileReload.button = GuiAuto.findButton({ "reload", "refill", "blade" }, gui)
+        or GuiAuto.findButton({ "reload", "refill", "blade" })
+    if not MobileReload.button and gui then
+        for _, instance in ipairs(gui:GetDescendants()) do
+            local ok, isButton = pcall(function() return instance:IsA("GuiButton") end)
+            if ok and isButton and not isOurs(instance) and guiVisible(instance) then
+                local name = normText(instance.Name)
+                local text = ""
+                pcall(function() text = normText(instance.Text) end)
+                if name == "r" or text == "r"
+                    or name == "reload" or text == "reload" then
+                    MobileReload.button = instance
+                    break
+                end
+            end
+        end
+    end
+    return MobileReload.button
+end
+
+local function reloadPress(hold)
+    if IS_MOBILE then
+        local button = mobileReloadButton()
+        if fireGuiButton(button) then return true end
+    end
+    return keyTap(Enum.KeyCode.R, hold or 0.5)
+end
+
 -- R is a hold, not a tap. Keep it down between ticks so the station sees a
 -- continuous hold, and release it the moment the blades are full.
 local function refillKeyDown()
@@ -2740,8 +3971,15 @@ local function refillAttempt(now, root, sets, durability, gas)
 
     Refill.attempts = (Refill.attempts or 0) + 1
     local prompt = findPrompt(part)
+    local holdBegin = false
+    if prompt then
+        pcall(function() holdBegin = type(prompt.InputHoldBegin) == "function" end)
+    end
+    local promptReady = prompt and (caps.prompt or holdBegin)
     local method = "key"
-    if Refill.attempts % 2 == 0 and prompt and caps.prompt then method = "prompt" end
+    if promptReady and (IS_MOBILE or (Refill.attempts % 2 == 0 and caps.prompt)) then
+        method = "prompt"
+    end
     local hold = math.max(0.5, math.min(10, tonumber(cfg.refillHold) or 3))
     Refill.attempt = {
         started = now, progressAt = now, method = method, part = part, hold = hold,
@@ -2754,8 +3992,7 @@ local function refillAttempt(now, root, sets, durability, gas)
     local _, rootNow = myChar()
     refillTeleport(rootNow or root, part)
     if method == "prompt" then
-        pcall(function() prompt.HoldDuration = 0 end)
-        pcall(fireproximityprompt, prompt)
+        firePrompt(prompt)
     else
         refillKeyDown()
     end
@@ -2956,7 +4193,7 @@ local function refillTick(now, root)
             return false
         end
         if now >= (Refill.reloadNextPress or 0) then
-            keyTap(Enum.KeyCode.R, 0.5)
+            reloadPress(0.5)
             Refill.reloadTries = (Refill.reloadTries or 0) + 1
             Refill.reloadNextPress = now + 1.0
         end
@@ -3015,7 +4252,7 @@ local function refillTick(now, root)
             tostring(sets), durability and string.format("%.2f", durability) or "-")
         S.refillMsg = S.state
         say(S.state)
-        keyTap(Enum.KeyCode.R, 0.5)
+        reloadPress(0.5)
         Refill.reloadTries = 1
         Refill.reloadNextPress = now + 1.0
         return false
@@ -3138,7 +4375,7 @@ end
 function Exit.writeLast(tag, detail)
     local stamp = os.date("%H:%M:%S")
     local lines = {
-        "AOTR internal v" .. VERSION .. " exit recorder " .. os.date("%Y-%m-%d %H:%M:%S"),
+        "AOTR internal v2.9 exit recorder " .. os.date("%Y-%m-%d %H:%M:%S"),
         "tag: " .. tostring(tag),
         "detail: " .. Exit.clean(detail),
         "last 10 flight entries:",
@@ -3238,7 +4475,7 @@ end
 
 -- Retry rungs, rotated in this order until the results screen is gone. Every
 -- attempt is re-verified; firing a signal is not treated as success.
-local RETRY_METHODS = { "connections", "input", "gamepad" }
+local RETRY_METHODS = IS_MOBILE and { "connections" } or { "connections", "input", "gamepad" }
 
 local function retryAnchors()
     local playerGui = getPlayerGui()
@@ -3364,6 +4601,14 @@ local function retryFire(button)
                     if not okFire then okFire = pcall(function() connection:Fire() end) end
                     if okFire then fired = fired + 1 end
                 end
+            end
+        end
+    end
+    if fired == 0 and caps.firesignal then
+        for _, name in ipairs({ "Activated", "MouseButton1Click" }) do
+            if pcall(firesignal, button[name]) then
+                fired, seen = fired + 1, seen + 1
+                break
             end
         end
     end
@@ -3599,7 +4844,10 @@ end
 local function guiSwing()
     local button = slashButton()
     if not button then return false end
-    if not fireSignal(button.MouseButton1Down) then return false end
+    if not fireSignal(button.MouseButton1Down) then
+        -- Mobile input often only exposes an Activated handler.
+        return fireSignal(button.Activated) or fireSignal(button.MouseButton1Click)
+    end
     task.delay(0.03, function()
         pcall(function() fireSignal(button.MouseButton1Up) end)
     end)
@@ -3816,7 +5064,13 @@ local function executeSwing(countStats, pullRan)
     task.delay(0.03, function() S.slashReleaseAt = nil end)
 
     local swingPath = cfg.attackPath
-    if swingPath ~= "gui" and swingPath ~= "remote" then swingPath = "mouse" end
+    if IS_MOBILE then
+        if swingPath ~= "gui" and swingPath ~= "remote" then
+            swingPath = (type(Net) == "table" and Net.post) and "remote" or "gui"
+        end
+    elseif swingPath ~= "gui" and swingPath ~= "remote" then
+        swingPath = "mouse"
+    end
     S.meter.armAt = clock()
     S.meter.armedRegistered = false
     -- The watch baseline must be taken before the click: a server can apply
@@ -3831,6 +5085,20 @@ local function executeSwing(countStats, pullRan)
         if fired then S.clickPath = "remote" end
     else
         fired = click(target)
+    end
+    if not fired and IS_MOBILE then
+        if swingPath ~= "remote" then
+            fired = remoteSwing(target) > 0
+            if fired then swingPath, S.clickPath = "remote", "remote" end
+        end
+        if not fired and swingPath ~= "gui" then
+            fired = guiSwing()
+            if fired then swingPath, S.clickPath = "gui", "gui" end
+        end
+        if not fired then
+            fired = click(target)
+            if fired then swingPath = "mouse" end
+        end
     end
     if not fired then
         if Pin.active then Pin.park("click failed") end
@@ -3929,7 +5197,6 @@ end
 
 local function fastTick(now)
     if not S.running then return end
-    Refill.readBlades(localChar())
     if S.owner ~= "refill" then
         if S.reloading and Hover.base then
             S.owner = "farm"
@@ -4027,7 +5294,7 @@ local function fastTick(now)
     end
 
     local height = cfg.hover or 200
-    local _, titanType = pcall(function() return target.model:GetAttribute("Type") end)
+    local titanType = target.model:GetAttribute("Type")
     if target.name == "Attack_Titan" or titanType == "Attack" or titanType == "Colossal" then
         height = height + 40
     elseif titanType == "Stall" then
@@ -4038,18 +5305,25 @@ local function fastTick(now)
     local titanPos = hrp.Position
     hoverAt(root, titanPos, height)
 
-    local okPos, napePosition = pcall(function() return nape.Position end)
-    local okTitan, titanDistance = pcall(function() return (titanPos - root.Position).Magnitude end)
-    S.titanDist = okTitan and titanDistance or nil
-    S.dist = S.titanDist
+    local napePosition = nape.Position
+    local titanDistance = (titanPos - root.Position).Magnitude
+    S.titanDist = titanDistance
+    S.dist = titanDistance
 
     local aimPoint = titanPos
-    if okPos and napePosition and (napePosition - root.Position).Magnitude >= 12 then
+    if napePosition and (napePosition - root.Position).Magnitude >= 12 then
         aimPoint = napePosition
     end
     if cfg.multiHit and (S.cluster or 0) >= cfg.multiMin then
-        local centre = clusterCentre(target.model)
-        if centre then aimPoint = centre end
+        -- Re-centre only when the target changes or a quarter second passes;
+        -- this scan is over every titan and does not need the 50 ms tick rate.
+        if S.clusterCentreTarget ~= target.model
+            or now - (S.clusterCentreAt or -1) >= 0.25 then
+            S.clusterCentreTarget = target.model
+            S.clusterCentreAt = now
+            S.clusterCentrePos = clusterCentre(target.model)
+        end
+        if S.clusterCentrePos then aimPoint = S.clusterCentrePos end
     end
 
     S.aimTick = (S.aimTick or 0) + 1
@@ -4097,7 +5371,8 @@ local function slowTick(now)
     end
 
     retryTick(now)
-    refreshStatus()
+    -- The panel timer refreshes statusText once a second; rebuilding the same
+    -- text four times a second here only burned CPU.
 end
 
 local function startFarm()
@@ -4351,6 +5626,27 @@ local function statusText()
             tostring(S.refills or "-"), tostring(Refill.maxSets or 3),
             S.durability and string.format("%.2f", S.durability) or "-")
     end)
+    add("slot", function() return "auto slot: " .. AutoSlot.describe() end)
+    add("menu", function() return "auto menu: " .. AutoSlot.describeMenu() end)
+    add("missions", function()
+        if cfg.autoStartMissions ~= true then return "auto missions: OFF" end
+        local names = {}
+        for _, def in ipairs(AutoExec.missionModDefs) do
+            if cfg[def.key] == true then names[#names + 1] = def.name end
+        end
+        local state = AutoExec.missionBusy and "starting"
+            or (currentKind() == "mission" and "in mission" or "waiting")
+        return "auto missions: ON   " .. tostring(cfg.missionMap)
+            .. " / " .. tostring(cfg.missionObjective)
+            .. "   hardest-first   " .. state
+            .. "   mods: " .. (#names > 0 and table.concat(names, ", ") or "none")
+    end)
+    add("mission-note", function()
+        if cfg.autoStartMissions == true and AutoExec.missionMsg then
+            return "mission: " .. tostring(AutoExec.missionMsg)
+        end
+        return nil
+    end)
     add("auto", function() return AutoExec.describe() end)
     add("autostart", function() return "autostart: " .. BOOT.describe() end)
     add("auto-note", function()
@@ -4378,20 +5674,19 @@ end
 --============================================================================
 --  PANEL
 --============================================================================
-local ACCENT = Color3.fromRGB(124, 92, 220)
-local IDLE = Color3.fromRGB(58, 44, 88)
-local savePending = false
+UI.ACCENT = Color3.fromRGB(124, 92, 220)
+UI.IDLE = Color3.fromRGB(58, 44, 88)
 
 local function scheduleSave()
-    if savePending then return end
-    savePending = true
+    if UI.savePending then return end
+    UI.savePending = true
     task.delay(1, function()
-        savePending = false
+        UI.savePending = false
         saveCfg()
     end)
 end
 
-local AOTR = { version = VERSION, _token = ACTIVE_TOKEN, _job = SERVER_KEY }
+local AOTR = { version = "2.9", _token = ACTIVE_TOKEN, _job = SERVER_KEY }
 
 local function buildUI()
     local holder = (caps.gethui and probe(gethui)) or getPlayerGui()
@@ -4409,10 +5704,15 @@ local function buildUI()
     gui.Parent = holder
     UI.gui = gui
 
+    local cam = currentCamera()
+    local viewport = cam and cam.ViewportSize or Vector2.new(800, 600)
+    local mainWidth = math.min(360, math.max(260, viewport.X - 24))
+    local mainHeight = math.min(500, math.max(220, viewport.Y - 80))
+
     local main = Instance.new("Frame")
     main.Name = "Main"
-    main.Size = UDim2.fromOffset(360, 500)
-    main.Position = UDim2.fromOffset(14, 64)
+    main.Size = UDim2.fromOffset(mainWidth, mainHeight)
+    main.Position = UDim2.fromOffset(12, 54)
     main.BackgroundColor3 = Color3.fromRGB(17, 13, 26)
     main.BorderSizePixel = 0
     main.Parent = gui
@@ -4440,23 +5740,49 @@ local function buildUI()
     title.Size = UDim2.new(1, -30, 1, 0)
     title.Position = UDim2.fromOffset(10, 0)
     title.BackgroundTransparency = 1
-    title.Text = "AOTR internal  v" .. VERSION .. "  b" .. (BUILD:match("%.(%d+)$") or "?")
+    title.Text = "AOTR internal  v2.9  b" .. (BUILD:match("%.(%d+)$") or "?")
     title.TextColor3 = Color3.fromRGB(226, 218, 255)
     title.Font = Enum.Font.GothamMedium
     title.TextSize = 13
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Parent = header
 
+    local reopen = nil
+    if IS_MOBILE then
+        reopen = Instance.new("TextButton")
+        reopen.Name = "Reopen"
+        reopen.Size = UDim2.fromOffset(70, 34)
+        reopen.Position = UDim2.fromOffset(12, 54)
+        reopen.BackgroundColor3 = UI.ACCENT
+        reopen.BorderSizePixel = 0
+        reopen.Text = "AOTR"
+        reopen.TextColor3 = Color3.fromRGB(255, 255, 255)
+        reopen.Font = Enum.Font.GothamBold
+        reopen.TextSize = 14
+        reopen.Visible = false
+        reopen.Parent = gui
+        local reopenCorner = Instance.new("UICorner")
+        reopenCorner.CornerRadius = UDim.new(0, 6)
+        reopenCorner.Parent = reopen
+        reopen.Activated:Connect(safe(function()
+            main.Visible = true
+            reopen.Visible = false
+        end, "connect"))
+    end
+
     local close = Instance.new("TextButton")
-    close.Size = UDim2.fromOffset(24, 22)
-    close.Position = UDim2.new(1, -28, 0, 4)
+    close.Size = UDim2.fromOffset(IS_MOBILE and 30 or 24, IS_MOBILE and 28 or 22)
+    close.Position = UDim2.new(1, IS_MOBILE and -34 or -28, 0, IS_MOBILE and 1 or 4)
     close.BackgroundTransparency = 1
     close.Text = "x"
     close.TextColor3 = Color3.fromRGB(180, 160, 220)
     close.Font = Enum.Font.Gotham
     close.TextSize = 14
     close.Parent = header
-    close.MouseButton1Click:Connect(safe(function() main.Visible = false end, "connect"))
+    close.Activated:Connect(safe(function()
+        main.Visible = false
+        if reopen then reopen.Visible = true end
+    end, "connect"))
 
     local body = Instance.new("ScrollingFrame")
     body.Name = "Body"
@@ -4505,8 +5831,8 @@ local function buildUI()
 
     local function addButton(parent, text, onClick, height)
         local button = Instance.new("TextButton")
-        button.Size = UDim2.new(1, 0, 0, height or 26)
-        button.BackgroundColor3 = IDLE
+        button.Size = UDim2.new(1, 0, 0, height or (IS_MOBILE and 32 or 26))
+        button.BackgroundColor3 = UI.IDLE
         button.BorderSizePixel = 0
         button.Text = text
         button.TextColor3 = Color3.fromRGB(232, 226, 255)
@@ -4517,7 +5843,7 @@ local function buildUI()
         local c = Instance.new("UICorner")
         c.CornerRadius = UDim.new(0, 4)
         c.Parent = button
-        button.MouseButton1Click:Connect(safe(function()
+        button.Activated:Connect(safe(function()
             local ok, err = pcall(onClick, button)
             if not ok then say("button '" .. text .. "' failed: " .. tostring(err)) end
         end, "connect"))
@@ -4526,7 +5852,7 @@ local function buildUI()
 
     local function addToggle(parent, label, key, after)
         local button = Instance.new("TextButton")
-        button.Size = UDim2.new(1, 0, 0, 26)
+        button.Size = UDim2.new(1, 0, 0, IS_MOBILE and 32 or 26)
         button.BorderSizePixel = 0
         button.Font = Enum.Font.GothamMedium
         button.TextSize = 12
@@ -4539,10 +5865,10 @@ local function buildUI()
 
         local function update()
             button.Text = label .. "   [" .. (cfg[key] and "ON" or "OFF") .. "]"
-            button.BackgroundColor3 = cfg[key] and ACCENT or IDLE
+            button.BackgroundColor3 = cfg[key] and UI.ACCENT or UI.IDLE
         end
         update()
-        button.MouseButton1Click:Connect(safe(function()
+        button.Activated:Connect(safe(function()
             cfg[key] = not cfg[key]
             update()
             scheduleSave()
@@ -4557,7 +5883,7 @@ local function buildUI()
 
     local function addSlider(parent, label, key, minimum, maximum, step)
         local frame = Instance.new("Frame")
-        frame.Size = UDim2.new(1, 0, 0, 30)
+        frame.Size = UDim2.new(1, 0, 0, IS_MOBILE and 36 or 30)
         frame.BackgroundColor3 = Color3.fromRGB(24, 19, 36)
         frame.BorderSizePixel = 0
         frame.LayoutOrder = nextOrder()
@@ -4596,29 +5922,30 @@ local function buildUI()
             value.Text = tostring(cfg[key])
         end
 
+        local buttonSize = IS_MOBILE and 28 or 20
         local minus = Instance.new("TextButton")
-        minus.Size = UDim2.fromOffset(20, 20)
-        minus.Position = UDim2.new(1, -46, 0, 5)
-        minus.BackgroundColor3 = IDLE
+        minus.Size = UDim2.fromOffset(buttonSize, buttonSize)
+        minus.Position = UDim2.new(1, -buttonSize * 2 - 4, 0, IS_MOBILE and 3 or 5)
+        minus.BackgroundColor3 = UI.IDLE
         minus.BorderSizePixel = 0
         minus.Text = "-"
         minus.TextColor3 = Color3.fromRGB(232, 226, 255)
         minus.Font = Enum.Font.GothamBold
         minus.TextSize = 12
         minus.Parent = frame
-        minus.MouseButton1Click:Connect(safe(function() bump(-1) end, "connect"))
+        minus.Activated:Connect(safe(function() bump(-1) end, "connect"))
 
         local plus = Instance.new("TextButton")
-        plus.Size = UDim2.fromOffset(20, 20)
-        plus.Position = UDim2.new(1, -24, 0, 5)
-        plus.BackgroundColor3 = IDLE
+        plus.Size = UDim2.fromOffset(buttonSize, buttonSize)
+        plus.Position = UDim2.new(1, -buttonSize - 2, 0, IS_MOBILE and 3 or 5)
+        plus.BackgroundColor3 = UI.IDLE
         plus.BorderSizePixel = 0
         plus.Text = "+"
         plus.TextColor3 = Color3.fromRGB(232, 226, 255)
         plus.Font = Enum.Font.GothamBold
         plus.TextSize = 12
         plus.Parent = frame
-        plus.MouseButton1Click:Connect(safe(function() bump(1) end, "connect"))
+        plus.Activated:Connect(safe(function() bump(1) end, "connect"))
 
         local function update()
             name.Text = label
@@ -4629,11 +5956,229 @@ local function buildUI()
         return frame
     end
 
+    local function addSlotPicker(parent)
+        local letters = { "A", "B", "C" }
+        local height = IS_MOBILE and 38 or 30
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 0, height)
+        frame.BackgroundColor3 = Color3.fromRGB(24, 19, 36)
+        frame.BorderSizePixel = 0
+        frame.LayoutOrder = nextOrder()
+        frame.Parent = parent
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 4)
+        c.Parent = frame
+
+        local buttonSize = IS_MOBILE and 32 or 24
+        local gap = 4
+        local total = #letters * buttonSize + (#letters - 1) * gap
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -total - 16, 1, 0)
+        label.Position = UDim2.fromOffset(8, 0)
+        label.BackgroundTransparency = 1
+        label.Text = "Save slot"
+        label.TextColor3 = Color3.fromRGB(214, 205, 240)
+        label.Font = Enum.Font.Gotham
+        label.TextSize = 11
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = frame
+
+        local buttons = {}
+        local function update()
+            local selected = slotChoiceOf(cfg.slotChoice)
+            for index, button in ipairs(buttons) do
+                local active = selected == letters[index]
+                button.BackgroundColor3 = active and UI.ACCENT or UI.IDLE
+                button.TextColor3 = active
+                    and Color3.fromRGB(255, 255, 255)
+                    or Color3.fromRGB(232, 226, 255)
+            end
+        end
+
+        for index, letter in ipairs(letters) do
+            local button = Instance.new("TextButton")
+            button.Name = "Slot" .. letter
+            button.Size = UDim2.fromOffset(buttonSize, buttonSize)
+            button.Position = UDim2.new(
+                1,
+                -total - 4 + (index - 1) * (buttonSize + gap),
+                0,
+                (height - buttonSize) / 2)
+            button.BackgroundColor3 = UI.IDLE
+            button.BorderSizePixel = 0
+            button.Text = letter
+            button.TextColor3 = Color3.fromRGB(232, 226, 255)
+            button.Font = Enum.Font.GothamBold
+            button.TextSize = 12
+            button.Parent = frame
+            local b = Instance.new("UICorner")
+            b.CornerRadius = UDim.new(0, 4)
+            b.Parent = button
+            button.Activated:Connect(safe(function()
+                cfg.slotChoice = letter
+                AutoSlot.reset("choice " .. letter)
+                update()
+                scheduleSave()
+                refreshStatus()
+            end, "connect"))
+            buttons[#buttons + 1] = button
+        end
+        update()
+        UI.controls[#UI.controls + 1] = update
+        return frame
+    end
+
+    local function addPicker(parent, label, getOptions, getValue, setValue)
+        local height = IS_MOBILE and 54 or 46
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 0, height)
+        frame.BackgroundColor3 = Color3.fromRGB(24, 19, 36)
+        frame.BorderSizePixel = 0
+        frame.LayoutOrder = nextOrder()
+        frame.Parent = parent
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 4)
+        c.Parent = frame
+
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, -12, 0, 14)
+        title.Position = UDim2.fromOffset(8, 3)
+        title.BackgroundTransparency = 1
+        title.Text = label
+        title.TextColor3 = Color3.fromRGB(150, 134, 186)
+        title.Font = Enum.Font.Gotham
+        title.TextSize = 10
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Parent = frame
+
+        local buttonHeight = IS_MOBILE and 30 or 24
+        local top = height - buttonHeight - 2
+        local function arrow(text, x, anchor)
+            local button = Instance.new("TextButton")
+            button.Size = UDim2.fromOffset(buttonHeight, buttonHeight)
+            button.Position = UDim2.new(anchor, x, 0, top)
+            button.BackgroundColor3 = UI.IDLE
+            button.BorderSizePixel = 0
+            button.Text = text
+            button.TextColor3 = Color3.fromRGB(232, 226, 255)
+            button.Font = Enum.Font.GothamBold
+            button.TextSize = 12
+            button.Parent = frame
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 4)
+            corner.Parent = button
+            return button
+        end
+
+        local previous = arrow("<", 6, 0)
+        local following = arrow(">", -6, 1)
+        local valueButton = Instance.new("TextButton")
+        valueButton.Size = UDim2.new(1, -buttonHeight * 2 - 26, 0, buttonHeight)
+        valueButton.Position = UDim2.fromOffset(buttonHeight + 10, top)
+        valueButton.BackgroundColor3 = UI.IDLE
+        valueButton.BorderSizePixel = 0
+        valueButton.TextColor3 = Color3.fromRGB(232, 226, 255)
+        valueButton.Font = Enum.Font.GothamMedium
+        valueButton.TextSize = 12
+        valueButton.Parent = frame
+        local valueCorner = Instance.new("UICorner")
+        valueCorner.CornerRadius = UDim.new(0, 4)
+        valueCorner.Parent = valueButton
+
+        local function update()
+            local options = getOptions()
+            local value = tostring(getValue() or "")
+            local index = table.find(options, value)
+            valueButton.Text = value
+                .. (index and ("   " .. index .. "/" .. #options) or "")
+        end
+
+        local function shift(direction)
+            local options = getOptions()
+            if #options == 0 then return end
+            local index = table.find(options, getValue()) or 1
+            index = (index - 1 + direction) % #options + 1
+            setValue(options[index])
+            update()
+            scheduleSave()
+            refreshStatus()
+        end
+
+        previous.Activated:Connect(safe(function() shift(-1) end, "connect"))
+        following.Activated:Connect(safe(function() shift(1) end, "connect"))
+        valueButton.Activated:Connect(safe(function() shift(1) end, "connect"))
+        update()
+        UI.controls[#UI.controls + 1] = update
+        return update
+    end
+
     addToggle(body, "Auto farm", "autoFarm", function(value)
         if value then startFarm() else stopFarm() end
         saveCfg(true)
     end)
-    addLabel(body, "P starts/stops. RightControl hides this panel.")
+    addLabel(body, IS_MOBILE
+        and "Tap Auto farm to start/stop. x hides this panel."
+        or "P starts/stops. RightControl hides this panel.")
+    addToggle(body, "Auto slot", "autoSlot", function(value)
+        AutoSlot.reset(value and ("choice " .. cfg.slotChoice) or "off")
+        refreshStatus()
+    end)
+    addSlotPicker(body)
+    addToggle(body, "Auto menu", "autoMenu", function(value)
+        AutoSlot.resetMenu(value and "waiting for title PLAY" or "off")
+        refreshStatus()
+    end)
+    addToggle(body, "Auto start missions", "autoStartMissions", function(value)
+        AutoExec.missionNext = 0
+        AutoExec.missionMsg = value and "waiting for a Town Central lobby" or "off"
+        refreshStatus()
+    end)
+    addLabel(body, "Hardest available first (Freedom -> Easy). Starts in Town Central.")
+    local objectivePickerUpdate
+    addPicker(body, "Mission map", AutoExec.missionMapNames,
+        function() return cfg.missionMap end,
+        function(name)
+            cfg.missionMap = name
+            AutoExec.missionFixSelection()
+            if objectivePickerUpdate then objectivePickerUpdate() end
+        end)
+    objectivePickerUpdate = addPicker(body, "Objective (Random = auto)",
+        function() return AutoExec.missionObjectiveOptions(cfg.missionMap) end,
+        function() return cfg.missionObjective end,
+        function(objective) cfg.missionObjective = objective end)
+    addLabel(body, "Mission modifiers (tap/click to select):")
+    addToggle(body, "Mod: No Perks", "modNoPerks")
+    addToggle(body, "Mod: No Skills", "modNoSkills")
+    addToggle(body, "Mod: No Memories", "modNoMemories")
+    addToggle(body, "Mod: Nightmare", "modNightmare")
+    addToggle(body, "Mod: Oddball", "modOddball")
+    addToggle(body, "Mod: Injury Prone", "modInjuryProne")
+    addToggle(body, "Mod: Chronic Injuries", "modChronicInjuries")
+    addToggle(body, "Mod: Fog", "modFog")
+    addToggle(body, "Mod: Glass Cannon", "modGlassCannon")
+    addToggle(body, "Mod: Time Trial", "modTimeTrial")
+    addToggle(body, "Mod: Fatigue", "modFatigue")
+    addToggle(body, "Mod: Evolution", "modEvolution")
+    addToggle(body, "Mod: Boring", "modBoring")
+    addToggle(body, "Mod: Simple", "modSimple")
+    addToggle(body, "Mod: Primitive", "modPrimitive")
+    addLabel(body, "Performance (optional):")
+    addToggle(body, "Disable 3D rendering", "disable3D", function()
+        AutoExec.Visual.apply()
+    end)
+    addToggle(body, "Performance mode (30 FPS)", "performance", function()
+        AutoExec.Visual.apply()
+    end)
+    addToggle(body, "Remove fog", "removeFog", function()
+        AutoExec.Visual.apply()
+    end)
+    addButton(body, "Restore visuals", function()
+        cfg.disable3D, cfg.performance, cfg.removeFog = false, false, false
+        AutoExec.Visual.restore()
+        refreshControls()
+        scheduleSave()
+        refreshStatus()
+    end)
     addSlider(body, "Hover height", "hover", 40, 300, 5)
     addSlider(body, "Attack rate", "attackHz", 1, 40, 1)
     addToggle(body, "Auto reload", "autoReload")
@@ -4740,6 +6285,9 @@ local built, buildErr = pcall(buildUI)
 if not built then setError("buildUI", buildErr) end
 -- Autoexecute pulls the remote script, so there is no local source to capture.
 pcall(AutoExec.refresh)
+if cfg.disable3D or cfg.performance or cfg.removeFog then
+    pcall(AutoExec.Visual.apply)
+end
 refreshControls()
 refreshStatus()
 pcall(Exit.start)
@@ -4842,7 +6390,7 @@ safeSpawn(function()
     say("remotes not found after 3 minutes - GUI fallbacks only")
 end)
 
-say("internal v" .. VERSION .. " loaded - RightControl hides the panel, P toggles the farm")
+say("internal v2.9 loaded - RightControl hides the panel, P toggles the farm")
 say("remotes: GET=" .. tostring(type(Net) == "table" and Net.get ~= nil)
     .. " GET_2=" .. tostring(type(Net) == "table" and Net.get2 ~= nil)
     .. " POST=" .. tostring(type(Net) == "table" and Net.post ~= nil))
